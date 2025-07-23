@@ -26,12 +26,7 @@ def decimal_to_native(obj):
 def lambda_handler(event, _):
     now   = int(datetime.datetime.utcnow().timestamp())
     since = now - 600  # last 10 minutes
-    resp = table.scan()
-    items = resp.get("Items", [])
-    
-    print(f"Found {len(items)} items in DynamoDB:")
-for it in items:
-    print(json.dumps(it, indent=2))
+
     # 1) Fetch raw items from DynamoDB
     resp = table.scan(
         FilterExpression="SK > :t",
