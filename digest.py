@@ -1,7 +1,14 @@
-import os, json, boto3, datetime, requests
+import os, json, boto3, datetime, urllib3
+from dateutil.tz import tzutc
 
+# AWS clients
 table      = boto3.resource("dynamodb").Table(os.environ["TABLE"])
 bedrock    = boto3.client("bedrock-agent-runtime")
+
+# HTTP client (no extra deps!)
+http       = urllib3.PoolManager()
+
+# Env vars
 TEAMS_URL  = os.environ["TEAMS_URL"]
 AGENT_ID   = os.environ["AGENT_ID"]
 
@@ -9,7 +16,7 @@ def lambda_handler(event, _):
     now   = int(datetime.datetime.utcnow().timestamp())
     since = now - 600  # 10 minutes
 
-    # DynamoDB query: SK > since (uses range key)
+    # 1) Fetch alerts from DynamoDB
     resp = table.scan(
         FilterExpression="SK > :t",
         ExpressionAttributeValues={":t": since}
@@ -17,15 +24,33 @@ def lambda_handler(event, _):
     alerts = [item["payload"] for item in resp.get("Items", [])]
 
     if not alerts:
-        return {"msg": "no alerts"}
+        return {"msg": "no alerts in window"}
 
-    prompt_input = json.dumps({"time_window": "10min", "alerts": alerts})
+    # 2) Build the input for Bedrock
+    payload = {
+        "input": {
+            "time_window": "last 10 minutes",
+            "alerts": alerts
+        }
+    }
 
+    # 3) Invoke the Bedrock Agent
     summary = bedrock.invoke_agent(
         agentId=AGENT_ID,
-        input=prompt_input,
+        input=json.dumps(payload),
         enableTrace=False
     )["completion"]
 
-    requests.post(TEAMS_URL, json={"text": summary}, timeout=4)
-    return {"alerts": len(alerts)}
+    # 4) POST to Teams via webhook
+    resp = http.request(
+        "POST",
+        TEAMS_URL,
+        body=json.dumps({"text": summary}),
+        headers={"Content-Type": "application/json"},
+        timeout=3.0
+    )
+
+    if resp.status != 200:
+        raise Exception(f"Teams webhook failed with status {resp.status}")
+
+    return {"alerts_summarized": len(alerts)}
