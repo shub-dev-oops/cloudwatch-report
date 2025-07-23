@@ -1,4 +1,8 @@
-import os, json, boto3, datetime, urllib3
+import os
+import json
+import boto3
+import datetime
+import urllib3
 from decimal import Decimal
 from dateutil.tz import tzutc
 
@@ -6,28 +10,27 @@ from dateutil.tz import tzutc
 table    = boto3.resource("dynamodb").Table(os.environ["TABLE"])
 bedrock  = boto3.client("bedrock-agent-runtime")
 
-# HTTP client
+# HTTP client (no extra deps)
 http     = urllib3.PoolManager()
 
 # Env vars
 TEAMS_URL = os.environ["TEAMS_URL"]
 AGENT_ID  = os.environ["AGENT_ID"]
 
-# Helper to convert Decimal → int/float
 def decimal_to_native(obj):
+    """Helper: convert Decimal to int/float for JSON."""
     if isinstance(obj, Decimal):
-        # if whole number, cast to int; otherwise to float
         if obj == obj.to_integral_value():
             return int(obj)
         return float(obj)
-    # Let the normal JSON encoder raise on other bad types
-    raise TypeError(f"Unserializable object {obj} of type {type(obj)}")
+    raise TypeError(f"Unserializable object {obj} ({type(obj)})")
 
-def lambda_handler(event, _):
+def lambda_handler(event, context):
+    # 1) Determine time window
     now   = int(datetime.datetime.utcnow().timestamp())
     since = now - 600  # last 10 minutes
 
-    # 1) Fetch raw items from DynamoDB
+    # 2) Fetch raw items from DynamoDB
     resp = table.scan(
         FilterExpression="SK > :t",
         ExpressionAttributeValues={":t": since}
@@ -37,13 +40,13 @@ def lambda_handler(event, _):
     if not raw_items:
         return {"msg": "no alerts in window"}
 
-    # 2) Extract payloads and convert Decimals
-    #    We dump & load with our helper to turn Decimals into ints/floats
+    # 3) Extract payloads and strip Decimals
     alerts = json.loads(
-        json.dumps([item["payload"] for item in raw_items], default=decimal_to_native)
+        json.dumps([item["payload"] for item in raw_items],
+                   default=decimal_to_native)
     )
 
-    # 3) Build Bedrock input
+    # 4) Prepare Bedrock input
     bedrock_input = {
         "input": {
             "time_window": "last 10 minutes",
@@ -51,14 +54,14 @@ def lambda_handler(event, _):
         }
     }
 
-    # 4) Invoke Bedrock Agent
+    # 5) Invoke the Bedrock Agent
     summary = bedrock.invoke_agent(
         agentId=AGENT_ID,
         input=json.dumps(bedrock_input),
         enableTrace=False
     )["completion"]
 
-    # 5) POST to Teams
+    # 6) POST summary to Teams
     resp = http.request(
         "POST",
         TEAMS_URL,
@@ -67,6 +70,7 @@ def lambda_handler(event, _):
         timeout=3.0
     )
     if resp.status != 200:
-        raise Exception(f"Teams webhook failed with status {resp.status}")
+        raise Exception(f"Teams webhook failed: {resp.status}")
 
+    # 7) Return success
     return {"alerts_summarized": len(alerts)}
