@@ -29,7 +29,12 @@ def lambda_handler(event, context):
     # 1) Compute time window
     now   = int(datetime.datetime.utcnow().timestamp())
     since = now - 600  # last 10 minutes
-
+    resp = table.scan()
+    items = resp.get("Items", [])
+    
+    print(f"Found {len(items)} items in DynamoDB:")
+for it in items:
+    print(json.dumps(it, indent=2))
     # 2) Fetch all items newer than 'since'
     resp = table.scan(
         FilterExpression="SK > :t",
