@@ -12,6 +12,15 @@ http       = urllib3.PoolManager()
 TEAMS_URL  = os.environ["TEAMS_URL"]
 AGENT_ID   = os.environ["AGENT_ID"]
 
+
+# Plain scan with no FilterExpression
+resp = table.scan()
+items = resp.get("Items", [])
+
+print(f"Found {len(items)} items in DynamoDB:")
+for it in items:
+    print(json.dumps(it, indent=2))
+
 def lambda_handler(event, _):
     now   = int(datetime.datetime.utcnow().timestamp())
     since = now - 600  # 10 minutes
