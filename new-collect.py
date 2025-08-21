@@ -180,9 +180,9 @@ def handler(event, ctx):
         TableName=TABLE,
         Key={"messageId": {"S": message_id}},
         UpdateExpression=(
-            "SET incidentKey=:ik, product=:p, source=:s, severity=:sev, "
-            "status=:st, environment=:env, service=:svc, body=:b, fromDisplay=:fd, "
-            "created=:cr, receivedAt=:ra, #ttl=:ttl"
+            "SET #incidentKey=:ik, #product=:p, #source=:s, #severity=:sev, "
+            "#status=:st, #environment=:env, #service=:svc, #body=:b, "
+            "#fromDisplay=:fd, #created=:cr, #receivedAt=:ra, #ttl=:ttl"
         ),
         ExpressionAttributeValues={
             ":ik":  item["incidentKey"],
@@ -198,7 +198,20 @@ def handler(event, ctx):
             ":ra":  item["receivedAt"],
             ":ttl": item["#ttl"],
         },
-        ExpressionAttributeNames={"#ttl": "ttl"}
+        ExpressionAttributeNames={
+            "#incidentKey": "incidentKey",
+            "#product": "product",
+            "#source": "source",
+            "#severity": "severity",
+            "#status": "status",
+            "#environment": "environment",
+            "#service": "service",
+            "#body": "body",
+            "#fromDisplay": "fromDisplay",
+            "#created": "created",
+            "#receivedAt": "receivedAt",
+            "#ttl": "ttl"
+        }
     )
 
     # Optional: store first 3 links into a lightweight side attribute (no list types to keep it simple)
