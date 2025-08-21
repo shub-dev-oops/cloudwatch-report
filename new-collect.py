@@ -43,13 +43,22 @@ def handler(event, ctx):
         Key={"messageId": {"S": message_id}},
         UpdateExpression="""
             SET teamId=:t, channelId=:c, body=:b, created=:cr, fromDisplay=:fd,
-                incidentKey=:ik, receivedAt=:ra, ttl=:ttl
+                incidentKey=:ik, receivedAt=:ra, #ttl=:ttl
         """,
         ExpressionAttributeValues={
-            ":t":{"S":team_id}, ":c":{"S":channel_id}, ":b":{"S":text},
-            ":cr":{"S":created}, ":fd":{"S":from_name}, ":ik":{"S":inc_key},
-            ":ra":{"N":str(now)}, ":ttl":{"N":str(ttl)}
+            ":t": {"S": team_id},
+            ":c": {"S": channel_id},
+            ":b": {"S": text},
+            ":cr": {"S": created},
+            ":fd": {"S": from_name},
+            ":ik": {"S": inc_key},
+            ":ra": {"N": str(now)},
+            ":ttl": {"N": str(ttl)}
+        },
+        ExpressionAttributeNames={
+            "#ttl": "ttl"   # aliasing the reserved word
         }
     )
+
 
     return {"statusCode": 202, "body": ""}
