@@ -1,23 +1,33 @@
 import os
 import json
 import re
+import hashlib
 import datetime as dt
 from typing import List, Dict
 
 import boto3
 from boto3.dynamodb.conditions import Attr
 
-# ----------- ENV VARS -----------
+# =========================
+# Environment Variables
+# =========================
 DDB_TABLE             = os.environ["DDB_TABLE"]                 # e.g., "sre-alerts"
-AGENT_ID              = os.environ["AGENT_ID"]                  # bedrock agent id
-AGENT_ALIAS_ID        = os.environ["AGENT_ALIAS_ID"]            # bedrock agent alias id
+AGENT_ID              = os.environ["AGENT_ID"]                  # Bedrock Agent ID
+AGENT_ALIAS_ID        = os.environ["AGENT_ALIAS_ID"]            # Bedrock Agent Alias ID
 TEAMS_WEBHOOK         = os.environ["TEAMS_WEBHOOK"]             # Teams Incoming Webhook URL
 PARAM_LAST_RUN        = os.environ.get("PARAM_LAST_RUN", "/sre-digest/last_run_utc")
 DEFAULT_LOOKBACK_MIN  = int(os.environ.get("DEFAULT_LOOKBACK_MIN", "60"))
-MAX_ITEMS             = int(os.environ.get("MAX_ITEMS", "200")) # safety cap per run
-MAX_BODIES_PER_CALL   = int(os.environ.get("MAX_BODIES_PER_CALL", "80")) # chunking for large volumes
+MAX_ITEMS             = int(os.environ.get("MAX_ITEMS", "200"))               # safety cap per run
+MAX_BODIES_PER_CALL   = int(os.environ.get("MAX_BODIES_PER_CALL", "80"))      # chunking to control tokens
 
-# ----------- CLIENTS -----------
+# Audit / behavior flags
+AUDIT_SUMMARY_IN_TEAMS = os.environ.get("AUDIT_SUMMARY_IN_TEAMS", "false").lower() == "true"
+AUDIT_MAX_IDS          = int(os.environ.get("AUDIT_MAX_IDS", "20"))
+STRICT_BODY_ONLY       = os.environ.get("STRICT_BODY_ONLY", "true").lower() == "true"
+
+# =========================
+# AWS Clients
+# =========================
 ddb        = boto3.resource("dynamodb")
 table      = ddb.Table(DDB_TABLE)
 ssm        = boto3.client("ssm")
@@ -26,7 +36,9 @@ agent_rt   = boto3.client("bedrock-agent-runtime")
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))  # Asia/Kolkata
 
 
-# ----------------- UTILITIES -----------------
+# =========================
+# Utilities
+# =========================
 def now_utc() -> dt.datetime:
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc, microsecond=0)
 
@@ -37,13 +49,12 @@ def iso_z(ts: dt.datetime) -> str:
     return ts.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def parse_dt(s: str) -> dt.datetime:
-    """Parse basic ISO string with or without Z."""
+    """Parse basic ISO string with or without Z; default to now if parse fails."""
     try:
         s = s.strip()
         if s.endswith("Z"):
             s = s[:-1]
             return dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
-        # naive -> assume UTC
         return dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
     except Exception:
         return now_utc()
@@ -51,33 +62,40 @@ def parse_dt(s: str) -> dt.datetime:
 def to_ist_label(start_utc: dt.datetime, end_utc: dt.datetime) -> str:
     s_ist = start_utc.astimezone(IST)
     e_ist = end_utc.astimezone(IST)
-    # e.g., "22 Aug 2025 09:00 – 10:00 IST"
-    same_day = s_ist.date() == e_ist.date()
-    if same_day:
+    if s_ist.date() == e_ist.date():
         return f"{s_ist.strftime('%d %b %Y %H:%M')} – {e_ist.strftime('%H:%M')} IST"
-    else:
-        return f"{s_ist.strftime('%d %b %Y %H:%M')} – {e_ist.strftime('%d %b %Y %H:%M')} IST"
+    return f"{s_ist.strftime('%d %b %Y %H:%M')} – {e_ist.strftime('%d %b %Y %H:%M')} IST"
+
+def body_hash(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
 
 
-# ----------------- STATE (SSM) -----------------
+# =========================
+# SSM Watermark
+# =========================
 def get_last_run_iso() -> str:
     try:
         r = ssm.get_parameter(Name=PARAM_LAST_RUN)
         return r["Parameter"]["Value"]
     except ssm.exceptions.ParameterNotFound:
-        # default: look back DEFAULT_LOOKBACK_MIN minutes
+        # Create a starting watermark = now-DEFAULT_LOOKBACK_MIN
         start = now_utc() - dt.timedelta(minutes=DEFAULT_LOOKBACK_MIN)
-        return iso_z(start)
+        start_iso = iso_z(start)
+        # seed parameter so next run is consistent
+        ssm.put_parameter(Name=PARAM_LAST_RUN, Value=start_iso, Type="String", Overwrite=True)
+        return start_iso
 
 def set_last_run_iso(ts_iso: str) -> None:
     ssm.put_parameter(Name=PARAM_LAST_RUN, Value=ts_iso, Type="String", Overwrite=True)
 
 
-# ----------------- DATA FETCH -----------------
+# =========================
+# DynamoDB Fetch (body-only)
+# =========================
 def fetch_recent_items(start_iso: str, end_iso: str) -> List[Dict]:
     """
-    MVP: Scan with FilterExpression on 'created' time string (ISO).
-    For prod scale, create a GSI on 'created' (String) and Query it.
+    MVP: Scan with FilterExpression on 'created' (string ISO).
+    For production, add a GSI on 'created' and use Query.
     """
     items: List[Dict] = []
     filt = Attr("created").between(start_iso, end_iso)
@@ -92,45 +110,50 @@ def fetch_recent_items(start_iso: str, end_iso: str) -> List[Dict]:
         )
         items.extend(resp.get("Items", []))
 
-    # We only keep items that actually have a 'body'
-    return [it for it in items if "body" in it and isinstance(it["body"], str) and it["body"].strip()]
-
+    # Keep minimal fields for audit; digest will use ONLY 'body'
+    kept = []
+    for it in items:
+        b = it.get("body")
+        if isinstance(b, str) and b.strip():
+            kept.append({
+                "messageId": it.get("messageId") or it.get("messageld") or it.get("id") or it.get("incidentKey") or "unknown",
+                "created": it.get("created") or it.get("receivedAt") or "",
+                "body": b
+            })
+    return kept
 
 def normalize_body_for_bedrock(bodies: List[str]) -> List[str]:
-    """
-    Optional pre-clean: trim, collapse whitespace. We do NOT parse fields—
-    the Agent prompt handles HTML/body parsing exactly as requested.
-    """
+    """Light cleanup only; Agent prompt will parse/format."""
     out = []
     for b in bodies:
-        # Trivial cleanup: unify whitespace, remove accidental nulls
-        bb = re.sub(r"\s+", " ", b or "").strip()
+        bb = re.sub(r"\s+", " ", (b or "")).strip()
         if bb:
             out.append(bb)
     return out
 
 
-# ----------------- BEDROCK CALL -----------------
+# =========================
+# Bedrock Agent Call
+# =========================
 def call_bedrock_agent(bodies: List[str], window_label_ist: str) -> str:
     """
-    Sends a single instruction + array of 'body' strings to the Bedrock Agent.
-    Assumes the Agent's System Prompt is already configured to:
-    - use only `body`,
-    - output a Markdown digest with emoji sections,
-    - no hallucinations.
+    Sends ONLY 'body' strings to the Agent.
+    The Agent's System Prompt must enforce:
+      - body-only parsing,
+      - emoji sections,
+      - Markdown output.
     """
-    # Keep payload compact; Agent prompt handles formatting.
     payload = {
-        "instruction": f"Create an SRE manager digest for this window (IST): {window_label_ist}. "
-                       f"Use ONLY the HTML body of each item below; ignore any other fields. "
-                       f"Output clean Markdown with emoji sections as per your instructions.",
+        "instruction": (
+            f"Create an SRE manager digest for this window (IST): {window_label_ist}. "
+            f"Use ONLY the HTML 'body' of each item below; ignore any other fields. "
+            f"Output clean Markdown with emoji sections."
+        ),
         "items": [{"body": b} for b in bodies]
     }
 
-    # Bedrock Agent requires a sessionId
     session_id = "sre-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
 
-    # Invoke Agent (text input)
     resp = agent_rt.invoke_agent(
         agentId=AGENT_ID,
         agentAliasId=AGENT_ALIAS_ID,
@@ -138,29 +161,24 @@ def call_bedrock_agent(bodies: List[str], window_label_ist: str) -> str:
         inputText=json.dumps(payload),
     )
 
-    # Collect streamed text if present; else try outputText
+    # Collect streamed or direct text
     result_text = ""
-    # Some SDKs return a 'completion' event list; others expose a 'completion' stream iterator.
-    # We try both patterns defensively.
     if "completion" in resp and isinstance(resp["completion"], list):
         for ev in resp["completion"]:
-            if "data" in ev:
+            if isinstance(ev, dict) and "data" in ev:
                 result_text += ev["data"]
     elif "outputText" in resp:
         result_text = resp["outputText"]
     elif "message" in resp:
-        # Fallback: some runtimes wrap it differently
         result_text = resp["message"].get("content", "")
 
     return (result_text or "").strip()
 
 
-# ----------------- TEAMS -----------------
+# =========================
+# Teams Webhook
+# =========================
 def post_markdown_to_teams(markdown_text: str) -> None:
-    """
-    Posts Markdown text to a Teams incoming webhook.
-    Keep payload minimal; Teams processes 'text' as basic markdown.
-    """
     import urllib.request
     body = json.dumps({"text": markdown_text}).encode("utf-8")
     req = urllib.request.Request(
@@ -173,18 +191,19 @@ def post_markdown_to_teams(markdown_text: str) -> None:
         _ = resp.read()
 
 
-# ----------------- HANDLER -----------------
+# =========================
+# Lambda Handler
+# =========================
 def lambda_handler(event, context):
     """
     EventBridge (cron hourly) friendly.
-    Also supports manual override window:
-      event = {
+    Supports manual override:
+      {
         "override_start_iso": "2025-08-21T13:00:00Z",
         "override_end_iso":   "2025-08-21T14:00:00Z"
       }
     """
     end_utc = now_utc()
-    start_iso = None
 
     override_start = (event or {}).get("override_start_iso")
     override_end   = (event or {}).get("override_end_iso")
@@ -199,31 +218,82 @@ def lambda_handler(event, context):
     start_utc = parse_dt(start_iso)
     end_utc   = parse_dt(end_iso)
 
-    # Window label for digest header (IST)
     window_label_ist = to_ist_label(start_utc, end_utc)
 
-    # Fetch items and extract bodies
+    # Fetch recent items
     items = fetch_recent_items(iso_z(start_utc), iso_z(end_utc))
+
+    # Intake / audit bookkeeping
+    audit = {
+        "window": window_label_ist,
+        "fetched_count": len(items),
+        "with_body_count": 0,
+        "deduped_unique_bodies": 0,
+        "forwarded_ids": [],
+        "skipped_no_body": [],
+        "dedup_groups": {}  # h -> {count, sample_ids}
+    }
+
     if not items:
-        # Nothing to do; still advance watermark
         set_last_run_iso(iso_z(end_utc))
         return {"ok": True, "message": "No items in window.", "window": window_label_ist}
 
-    bodies = normalize_body_for_bedrock([it["body"] for it in items])
+    # Build dedupe map by body content
+    by_hash: Dict[str, Dict] = {}
+    for it in items:
+        b = (it["body"] or "").strip()
+        mid = it.get("messageId", "unknown")
+        if not b:
+            audit["skipped_no_body"].append(mid)
+            continue
+        audit["with_body_count"] += 1
+        h = body_hash(b)
+        g = by_hash.setdefault(h, {"body": b, "ids": [], "created": []})
+        g["ids"].append(mid)
+        g["created"].append(it.get("created", ""))
 
-    # Chunk if too many bodies (to keep token use reasonable)
+    audit["deduped_unique_bodies"] = len(by_hash)
+
+    # Forward exactly one representative per identical body to Bedrock
+    bodies_all = [g["body"] for g in by_hash.values()]
+    bodies_all = normalize_body_for_bedrock(bodies_all)
+
+    # Track which IDs are covered by the forwarded bodies
+    covered_ids = []
+    for g in by_hash.values():
+        covered_ids.extend(g["ids"])
+    audit["forwarded_ids"] = covered_ids[:AUDIT_MAX_IDS]
+
+    for h, g in by_hash.items():
+        audit["dedup_groups"][h] = {
+            "count": len(g["ids"]),
+            "sample_ids": g["ids"][:min(5, AUDIT_MAX_IDS)]
+        }
+
+    # Call Bedrock Agent in chunks if needed
     digests: List[str] = []
-    for i in range(0, len(bodies), MAX_BODIES_PER_CALL):
-        chunk = bodies[i:i + MAX_BODIES_PER_CALL]
+    for i in range(0, len(bodies_all), MAX_BODIES_PER_CALL):
+        chunk = bodies_all[i:i + MAX_BODIES_PER_CALL]
         md = call_bedrock_agent(chunk, window_label_ist)
         if md:
             digests.append(md)
 
     final_md = "\n\n---\n\n".join(digests).strip()
-
     if not final_md:
-        # Failsafe minimal output so managers see *something* if agent had an issue
         final_md = f"**SRE Digest – {window_label_ist}**\n\n_No actionable items parsed from alert bodies in this window._"
+
+    # Optional intake/audit summary appended to Teams
+    if AUDIT_SUMMARY_IN_TEAMS:
+        def join_ids(lst):
+            return ", ".join(str(x) for x in lst[:AUDIT_MAX_IDS]) + ("..." if len(lst) > AUDIT_MAX_IDS else "")
+        final_md += "\n\n---\n\n"
+        final_md += f"**🧾 Intake Summary**\n"
+        final_md += f"- Window: {audit['window']}\n"
+        final_md += f"- Fetched: {audit['fetched_count']} | With body: {audit['with_body_count']} | Unique bodies (after dedupe): {audit['deduped_unique_bodies']}\n"
+        if audit["skipped_no_body"]:
+            final_md += f"- Skipped (no body): {join_ids(audit['skipped_no_body'])}\n"
+        if audit["forwarded_ids"]:
+            final_md += f"- Covered IDs (forwarded via dedupe): {join_ids(audit['forwarded_ids'])}\n"
 
     # Post to Teams
     post_markdown_to_teams(final_md)
@@ -231,9 +301,16 @@ def lambda_handler(event, context):
     # Advance watermark
     set_last_run_iso(iso_z(end_utc))
 
-    return {
+    # Return details (and log full audit to CW)
+    ret = {
         "ok": True,
         "posted": True,
         "window": window_label_ist,
-        "items_processed": len(bodies)
+        "items_fetched": audit["fetched_count"],
+        "items_with_body": audit["with_body_count"],
+        "unique_bodies_forwarded": audit["deduped_unique_bodies"],
+        "forwarded_ids_sample": audit["forwarded_ids"],
+        "skipped_no_body_sample": audit["skipped_no_body"][:AUDIT_MAX_IDS]
     }
+    print("AUDIT:", json.dumps(audit)[:8000])  # truncated for log safety
+    return ret
