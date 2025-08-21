@@ -1,0 +1,8 @@
+{
+  "id": "@{triggerOutputs()?['body/id']}",
+  "teamId": "@{triggerOutputs()?['body/teamId']}",
+  "channelId": "@{triggerOutputs()?['body/channelId']}",
+  "createdDateTime": "@{triggerOutputs()?['body/createdDateTime']}",
+  "fromDisplay": "@{triggerOutputs()?['body/from/user/displayName']}",
+  "text": "@{triggerOutputs()?['body/body/content']}"
+}
