@@ -5,6 +5,8 @@ import hashlib
 import datetime as dt
 from typing import List, Dict, Optional
 import logging
+import urllib.request
+import urllib.error
 
 import boto3
 
@@ -346,71 +348,54 @@ def post_markdown_to_teams(markdown_text: str) -> bool:
     if not markdown_text:
         logger.warning("No text to post to Teams")
         return False
-        
-    logger.info(f"Posting {len(markdown_text)} chars to Teams webhook")
-    
-    # Try using requests library first (better handling of encoding)
+
+    payload = {"text": markdown_text}
+
+    # First try urllib (always available in Lambda)
     try:
-        import requests
-        response = requests.post(
-            TEAMS_WEBHOOK,
-            json={"text": markdown_text},
-            timeout=10
-        )
-        response.raise_for_status()
-        logger.info(f"Teams webhook response: status={response.status_code}")
-        return True
-    except ImportError:
-        logger.info("Requests library not available, falling back to urllib")
-    except Exception as e:
-        logger.error(f"Error posting to Teams with requests: {e}")
-        return False
-    
-    # Fall back to urllib with proper encoding
-    try:
-        # Make sure we properly encode Unicode characters
-        payload = {"text": markdown_text}
-        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")  # keep emojis
         req = urllib.request.Request(
             TEAMS_WEBHOOK,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        
         with urllib.request.urlopen(req, timeout=10) as resp:
-            status = resp.status
-            logger.info(f"Teams webhook response: status={status}")
-            return status >= 200 and status < 300
-    except Exception as e:
-        logger.error(f"Error posting to Teams webhook: {e}")
-        
-        # Last resort - try with ASCII only if it was a Unicode error
-        if isinstance(e, UnicodeEncodeError):
-            try:
-                logger.warning("Trying again with ASCII-only content")
-                # Replace Unicode characters with ASCII approximations
-                ascii_safe_md = markdown_text.encode('ascii', 'replace').decode('ascii')
-                payload = {"text": ascii_safe_md}
-                body = json.dumps(payload).encode("utf-8")
-                
-                req = urllib.request.Request(
-                    TEAMS_WEBHOOK,
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    status = resp.status
-                    logger.info(f"Teams webhook ASCII fallback response: status={status}")
-                    return status >= 200 and status < 300
-            except Exception as e2:
-                logger.error(f"Error in ASCII fallback: {e2}")
-        
-        return False
+            status = getattr(resp, "status", 200)
+            logger.info(f"Teams webhook (urllib) status={status}")
+            return 200 <= status < 300
+    except Exception as e1:
+        logger.error(f"Teams webhook via urllib failed: {e1}")
 
+    # Optional: try requests if layer/vendor is present (not in base Lambda runtime)
+    try:
+        import requests  # may not exist
+        r = requests.post(TEAMS_WEBHOOK, json=payload, timeout=10)
+        r.raise_for_status()
+        logger.info(f"Teams webhook (requests) status={r.status_code}")
+        return True
+    except ImportError:
+        logger.info("requests not available; skipped.")
+    except Exception as e2:
+        logger.error(f"Teams webhook via requests failed: {e2}")
+
+    # Final ASCII-only fallback (in case of weird unicode/network issues)
+    try:
+        ascii_safe = markdown_text.encode("ascii", "replace").decode("ascii")
+        body = json.dumps({"text": ascii_safe}, ensure_ascii=True).encode("utf-8")
+        req = urllib.request.Request(
+            TEAMS_WEBHOOK,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = getattr(resp, "status", 200)
+            logger.info(f"Teams webhook (ASCII fallback) status={status}")
+            return 200 <= status < 300
+    except Exception as e3:
+        logger.error(f"Teams webhook ASCII fallback failed: {e3}")
+        return False
 
 # =========================
 # Lambda Handler (Whole-day with Debug)
