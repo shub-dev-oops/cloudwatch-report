@@ -4,8 +4,13 @@ import re
 import hashlib
 import datetime as dt
 from typing import List, Dict, Optional
+import logging
 
 import boto3
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # =========================
 # Environment Variables
@@ -26,27 +31,12 @@ STRICT_BODY_ONLY         = os.environ.get("STRICT_BODY_ONLY", "true").lower() ==
 TRIM_TODAY_TO_NOW        = os.environ.get("TRIM_TODAY_TO_NOW", "true").lower() == "true"
 
 # 🔧 DEBUG controls
-DEBUG_MODE               = os.environ.get("DEBUG_MODE", "false").lower() == "true"
+DEBUG_MODE               = os.environ.get("DEBUG_MODE", "true").lower() == "true"  # Changed default to true
 DEBUG_FORCE_FULL_DAY     = os.environ.get("DEBUG_FORCE_FULL_DAY", "true").lower() == "true"
 DEBUG_PREVIEW_LEN        = int(os.environ.get("DEBUG_PREVIEW_LEN", "65"))
 SAVE_BEDROCK_LOGS        = os.environ.get("SAVE_BEDROCK_LOGS", "false").lower() == "true"
 BEDROCK_LOGS_S3_BUCKET   = os.environ.get("BEDROCK_LOGS_S3_BUCKET", "")
 BEDROCK_LOGS_S3_PREFIX   = os.environ.get("BEDROCK_LOGS_S3_PREFIX", "bedrock/digests/")
-
-# =========================
-# Environment Validation
-# =========================
-def validate_environment():
-    required_vars = ["DDB_TABLE", "AGENT_ID", "AGENT_ALIAS_ID", "TEAMS_WEBHOOK"]
-    missing = [var for var in required_vars if not os.environ.get(var)]
-    if missing:
-        raise ValueError(f"Missing required environment variables: {missing}")
-    
-    webhook_url = os.environ["TEAMS_WEBHOOK"]
-    if not webhook_url.startswith("https://"):
-        raise ValueError("TEAMS_WEBHOOK must be HTTPS URL")
-
-validate_environment()
 
 # =========================
 # AWS Clients
@@ -55,9 +45,9 @@ ddb        = boto3.resource("dynamodb")
 table      = ddb.Table(DDB_TABLE)
 agent_rt   = boto3.client("bedrock-agent-runtime")
 s3         = boto3.client("s3") if SAVE_BEDROCK_LOGS and BEDROCK_LOGS_S3_BUCKET else None
-cloudwatch = boto3.client('cloudwatch')
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))  # Asia/Kolkata
+
 
 # =========================
 # Utilities
@@ -78,7 +68,8 @@ def parse_dt(s: str) -> dt.datetime:
             s = s[:-1]
             return dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
         return dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Date parse error for '{s}': {e}")
         return now_utc()
 
 def body_hash(body: str) -> str:
@@ -86,27 +77,13 @@ def body_hash(body: str) -> str:
 
 def preview(s: str, n: int) -> str:
     s = (s or "").strip().replace("\n", " ")
-    return (s[:n] + "…") if len(s) > n else s
-
-def put_custom_metric(metric_name: str, value: float, unit: str = 'Count'):
-    try:
-        cloudwatch.put_metric_data(
-            Namespace='SRE/AlertDigest',
-            MetricData=[
-                {
-                    'MetricName': metric_name,
-                    'Value': value,
-                    'Unit': unit,
-                    'Timestamp': now_utc()
-                }
-            ]
-        )
-    except Exception as e:
-        print(f"METRIC_ERROR: {e}")
+    return (s[:n] + "...") if len(s) > n else s
 
 def to_ist_day_bounds(day_ist_str: Optional[str]) -> (dt.datetime, dt.datetime, str):
     """
     Returns (start_utc, end_utc, window_label_ist) for a full IST day.
+    If DEBUG_MODE & DEBUG_FORCE_FULL_DAY, end is always 23:59:59 IST even for 'today'.
+    Else if TRIM_TODAY_TO_NOW=true and day is today, end is 'now'.
     """
     now = now_utc().astimezone(IST)
     if not day_ist_str or day_ist_str.lower() == "today":
@@ -117,174 +94,197 @@ def to_ist_day_bounds(day_ist_str: Optional[str]) -> (dt.datetime, dt.datetime, 
         try:
             y, m, d = map(int, day_ist_str.split("-"))
             day_date = dt.date(y, m, d)
-        except Exception:
-            print(f"Invalid date format: {day_ist_str}, using today")
+        except Exception as e:
+            logger.warning(f"Invalid date format '{day_ist_str}', defaulting to today: {e}")
             day_date = now.date()
 
     start_ist = dt.datetime(day_date.year, day_date.month, day_date.day, 0, 0, 0, tzinfo=IST)
-    end_ist_full = start_ist + dt.timedelta(days=1)
+    end_ist_full = start_ist + dt.timedelta(days=1) - dt.timedelta(seconds=1)
 
     if DEBUG_MODE and DEBUG_FORCE_FULL_DAY:
-        end_ist = end_ist_full - dt.timedelta(seconds=1)
+        # Always full-day for the chosen date
+        end_ist = end_ist_full
     else:
         if TRIM_TODAY_TO_NOW and day_date == now.date() and now < end_ist_full:
             end_ist = now
         else:
-            end_ist = end_ist_full - dt.timedelta(seconds=1)
+            end_ist = end_ist_full
 
     start_utc = start_ist.astimezone(dt.timezone.utc)
     end_utc = end_ist.astimezone(dt.timezone.utc)
-    label = f"{start_ist.strftime('%d %b %Y 00:00')} – {end_ist.strftime('%H:%M')} IST"
+    label = f"{start_ist.strftime('%d %b %Y 00:00')} - {end_ist.strftime('%H:%M')} IST"
+    
+    logger.info(f"Time window: {label} ({start_utc.isoformat()} - {end_utc.isoformat()} UTC)")
     return start_utc, end_utc, label
 
+
 # =========================
-# Robust Timestamp Coercion - FIXED
+# Robust Timestamp Coercion
 # =========================
 def _parse_messy_created_str(s: str) -> Optional[dt.datetime]:
     """
-    Accepts '2025-08-2316:56:33.3692' or '2025-08-23T16:56:33.3692' and coerces to UTC dt.
+    Accepts '2025-08-21T14:33:32.8052', '2025-08-21714:33:32.8052', 
+    or other formats and coerces to UTC dt.
     """
     if not s or not isinstance(s, str):
         return None
     
-    s = s.strip().replace(" ", "")
-    
-    # Fix missing T separator
-    if "T" not in s and len(s) >= 15 and s[4] == "-" and s[7] == "-":
-        # Find where time portion starts (look for digits after date)
-        for i in range(10, len(s)):
-            if s[i].isdigit():
-                s = s[:i] + "T" + s[i:]
-                break
-    
-    # Remove timezone suffixes
-    s = re.sub(r"(IST|UTC)$", "", s, flags=re.I).strip()
-    
-    # Add Z if no timezone info
-    if not re.search(r"[zZ]|[+\-]\d\d:\d\d$", s):
-        s = s + "Z"
-    
     try:
+        # Clean up the string
+        s = s.strip().replace(" ", "")
+        
+        # Handle the case where T is missing
+        if "T" not in s and len(s) >= 15 and s[4] == "-" and s[7] == "-":
+            s = s[:10] + "T" + s[10:]
+            
+        # Remove timezone indicators
+        s = re.sub(r"(IST|UTC)$", "", s, flags=re.I).strip()
+        
+        # Add Z if no timezone info
+        if not re.search(r"[zZ]|[+\-]\d\d:\d\d$", s):
+            s = s + "Z"
+            
         return parse_dt(s)
     except Exception as e:
-        print(f"Failed to parse timestamp '{s}': {e}")
+        logger.debug(f"Failed to parse messy date '{s}': {e}")
         return None
 
 def coerce_item_ts_utc(it: Dict) -> Optional[dt.datetime]:
-    """Extract timestamp from DynamoDB item - handles both created string and receivedAt epoch."""
+    """Prefer 'created' string; else 'receivedAt' epoch seconds."""
+    # For debugging
+    debug_info = {}
     
-    # First try 'created' field
     created = it.get("created")
-    if isinstance(created, str) and created.strip():
+    if isinstance(created, str):
         dtc = _parse_messy_created_str(created)
         if dtc:
+            debug_info["used"] = "created"
+            debug_info["value"] = created
+            logger.debug(f"Using created timestamp: {created} -> {dtc.isoformat()}")
             return dtc
-    
-    # Fallback to 'receivedAt' epoch seconds
+        debug_info["created_failed"] = created
+
+    # Try receivedAt as epoch seconds
     recv = it.get("receivedAt")
-    if recv is not None:
-        try:
-            if isinstance(recv, (int, float)):
-                return dt.datetime.fromtimestamp(int(recv), tz=dt.timezone.utc)
-            if isinstance(recv, str) and recv.isdigit():
-                return dt.datetime.fromtimestamp(int(recv), tz=dt.timezone.utc)
-        except (ValueError, OSError) as e:
-            print(f"Invalid receivedAt timestamp {recv}: {e}")
+    try:
+        if isinstance(recv, (int, float)):
+            dt_recv = dt.datetime.fromtimestamp(int(recv), tz=dt.timezone.utc)
+            debug_info["used"] = "receivedAt"
+            debug_info["value"] = recv
+            logger.debug(f"Using receivedAt timestamp: {recv} -> {dt_recv.isoformat()}")
+            return dt_recv
+        if isinstance(recv, str) and recv.isdigit():
+            dt_recv = dt.datetime.fromtimestamp(int(recv), tz=dt.timezone.utc)
+            debug_info["used"] = "receivedAt"
+            debug_info["value"] = recv
+            logger.debug(f"Using receivedAt timestamp: {recv} -> {dt_recv.isoformat()}")
+            return dt_recv
+        debug_info["receivedAt_failed"] = recv
+    except Exception as e:
+        debug_info["receivedAt_error"] = str(e)
+        logger.debug(f"Failed to parse receivedAt '{recv}': {e}")
     
-    print(f"No valid timestamp found in item: {it.keys()}")
+    # Log for debugging if both methods failed
+    if DEBUG_MODE:
+        logger.warning(f"Could not determine timestamp for item: {json.dumps(debug_info)}")
+        if "messageId" in it:
+            logger.warning(f"Item messageId: {it['messageId']}")
+        elif "messageld" in it:
+            logger.warning(f"Item messageld: {it['messageld']}")
+    
     return None
 
+
 # =========================
-# DynamoDB Fetch - FIXED for your table structure
+# DynamoDB Fetch (whole-day, body-only)
 # =========================
 def fetch_items_for_window(start_utc: dt.datetime, end_utc: dt.datetime) -> List[Dict]:
     """
-    Full table scan + local filtering. Fixed to handle your table structure.
+    Full table scan (capped) + local filtering by coerce_item_ts_utc(it).
+    For production scale, use a GSI on a clean timestamp and Query.
     """
+    logger.info(f"Fetching items from DynamoDB table {DDB_TABLE}")
     items: List[Dict] = []
     
     try:
-        print(f"Scanning DDB table for window: {start_utc} to {end_utc}")
-        
         resp = table.scan(Limit=MAX_ITEMS)
         items.extend(resp.get("Items", []))
+        logger.info(f"Initial scan: {len(items)} items")
         
         while "LastEvaluatedKey" in resp and len(items) < MAX_ITEMS:
-            resp = table.scan(
-                ExclusiveStartKey=resp["LastEvaluatedKey"], 
-                Limit=MAX_ITEMS - len(items)
-            )
+            resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], Limit=MAX_ITEMS - len(items))
             items.extend(resp.get("Items", []))
-            
-        print(f"Scanned {len(items)} total items from DDB")
-        
+            logger.info(f"Additional scan: now have {len(items)} items total")
     except Exception as e:
-        print(f"DDB_SCAN_ERROR: {e}")
-        raise
+        logger.error(f"Error scanning DynamoDB: {e}")
+        return []
+
+    # Debug print of a sample item
+    if items and DEBUG_MODE:
+        sample = items[0]
+        sample_keys = list(sample.keys())
+        logger.info(f"Sample item keys: {sample_keys}")
+        if "body" in sample:
+            logger.info(f"Sample body preview: {preview(sample['body'], 100)}")
+        if "created" in sample:
+            logger.info(f"Sample created: {sample['created']}")
+        if "receivedAt" in sample:
+            logger.info(f"Sample receivedAt: {sample['receivedAt']}")
 
     kept = []
-    debug_items = []
+    time_filtered_count = 0
+    no_body_count = 0
     
     for it in items:
-        # Extract message ID - handle the typo in your table (messageld vs messageId)
-        mid = (it.get("messageId") or 
-               it.get("messageld") or  # Handle your table's typo
-               it.get("id") or 
-               it.get("incidentKey") or 
-               "unknown")
+        # Handle both messageId and messageld (lowercase L) cases
+        message_id = it.get("messageId") or it.get("messageld") or it.get("id") or it.get("incidentKey") or "unknown"
         
-        # Get timestamp
         ts = coerce_item_ts_utc(it)
         if ts is None:
-            debug_items.append(f"No timestamp: {mid}")
+            logger.debug(f"Item {message_id} has no valid timestamp")
             continue
             
-        # Get body content
-        body = it.get("body")
-        if not isinstance(body, str) or not body.strip():
-            debug_items.append(f"No body: {mid} @ {ts}")
-            continue
-        
-        # Check if in time window
+        # Check if timestamp is in our window
         if start_utc <= ts <= end_utc:
-            kept.append({
-                "messageId": mid,
-                "created": iso_z(ts),
-                "body": body.strip()
-            })
-            debug_items.append(f"KEPT: {mid} @ {ts}")
-        else:
-            debug_items.append(f"Out of window: {mid} @ {ts}")
+            time_filtered_count += 1
+            b = it.get("body")
+            if isinstance(b, str) and b.strip():
+                kept.append({
+                    "messageId": message_id,
+                    "created": iso_z(ts),
+                    "body": b
+                })
+            else:
+                no_body_count += 1
+                logger.debug(f"Item {message_id} has no body")
     
-    if DEBUG_MODE:
-        print("DEBUG_ITEMS (first 10):")
-        for line in debug_items[:10]:
-            print(f"  {line}")
-        if len(debug_items) > 10:
-            print(f"  ... and {len(debug_items) - 10} more")
-    
-    print(f"Kept {len(kept)} items in window {start_utc} to {end_utc}")
+    logger.info(f"Filtered results: {len(items)} total items, {time_filtered_count} in time window, {no_body_count} without body, {len(kept)} kept")
     return kept
 
 def normalize_body_for_bedrock(bodies: List[str]) -> List[str]:
     out = []
     for b in bodies:
-        # Clean up HTML and normalize whitespace
-        bb = re.sub(r"<[^>]+>", " ", b or "")  # Remove HTML tags
-        bb = re.sub(r"\s+", " ", bb).strip()   # Normalize whitespace
+        bb = re.sub(r"\s+", " ", (b or "")).strip()
         if bb:
             out.append(bb)
     return out
 
+
 # =========================
-# Bedrock Agent Call - With Error Handling
+# Bedrock Agent Call (body-only) + S3 logging
 # =========================
 def call_bedrock_agent(bodies: List[str], window_label_ist: str, session_id: str, chunk_idx: int) -> str:
+    if not bodies:
+        logger.warning("No bodies to send to Bedrock agent")
+        return ""
+        
+    logger.info(f"Calling Bedrock agent with {len(bodies)} bodies (chunk {chunk_idx})")
+    
     payload = {
         "instruction": (
             f"Create an SRE manager digest for this window (IST): {window_label_ist}. "
-            f"Use ONLY the text content of each alert below; ignore any other fields. "
-            f"Output clean Markdown with emoji sections. Group similar alerts together."
+            f"Use ONLY the HTML 'body' of each item below; ignore any other fields. "
+            f"Output clean Markdown with emoji sections."
         ),
         "items": [{"body": b} for b in bodies]
     }
@@ -297,26 +297,23 @@ def call_bedrock_agent(bodies: List[str], window_label_ist: str, session_id: str
             inputText=json.dumps(payload),
         )
     except Exception as e:
-        print(f"BEDROCK_AGENT_ERROR chunk-{chunk_idx}: {e}")
-        return f"⚠️ Failed to process chunk {chunk_idx + 1}: {str(e)}"
+        logger.error(f"Error calling Bedrock agent: {e}")
+        return f"**Error generating digest**: {str(e)}"
 
     result_text = ""
-    try:
-        if "completion" in resp and isinstance(resp["completion"], list):
-            for ev in resp["completion"]:
-                if isinstance(ev, dict) and "data" in ev:
-                    result_text += ev["data"]
-        elif "outputText" in resp:
-            result_text = resp["outputText"]
-        elif "message" in resp:
-            result_text = resp["message"].get("content", "")
-    except Exception as e:
-        print(f"BEDROCK_RESPONSE_PARSE_ERROR: {e}")
-        return f"⚠️ Failed to parse response for chunk {chunk_idx + 1}"
+    if "completion" in resp and isinstance(resp["completion"], list):
+        for ev in resp["completion"]:
+            if isinstance(ev, dict) and "data" in ev:
+                result_text += ev["data"]
+    elif "outputText" in resp:
+        result_text = resp["outputText"]
+    elif "message" in resp:
+        result_text = resp["message"].get("content", "")
 
     result_text = (result_text or "").strip()
+    logger.info(f"Bedrock response length: {len(result_text)} chars")
 
-    # Optional: Save Bedrock logs to S3
+    # Optional: Save Bedrock logs to S3 (payload previews + response)
     if SAVE_BEDROCK_LOGS and s3:
         try:
             body_previews = [preview(b, 200) for b in bodies]
@@ -337,22 +334,44 @@ def call_bedrock_agent(bodies: List[str], window_label_ist: str, session_id: str
                 ContentType="application/json"
             )
         except Exception as e:
-            print(f"BEDROCK_LOG_SAVE_ERR: {e}")
+            logger.error(f"BEDROCK_LOG_SAVE_ERR: {e}")
 
     return result_text
 
+
 # =========================
-# Teams Webhook - With Error Handling
+# Teams Webhook with Requests/Urllib Fallback
 # =========================
 def post_markdown_to_teams(markdown_text: str) -> bool:
-    import urllib.request
+    if not markdown_text:
+        logger.warning("No text to post to Teams")
+        return False
+        
+    logger.info(f"Posting {len(markdown_text)} chars to Teams webhook")
     
+    # Try using requests library first (better handling of encoding)
     try:
-        # Truncate if too long (Teams has limits)
-        if len(markdown_text) > 28000:
-            markdown_text = markdown_text[:27500] + "\n\n_[Content truncated due to length]_"
-            
-        body = json.dumps({"text": markdown_text}).encode("utf-8")
+        import requests
+        response = requests.post(
+            TEAMS_WEBHOOK,
+            json={"text": markdown_text},
+            timeout=10
+        )
+        response.raise_for_status()
+        logger.info(f"Teams webhook response: status={response.status_code}")
+        return True
+    except ImportError:
+        logger.info("Requests library not available, falling back to urllib")
+    except Exception as e:
+        logger.error(f"Error posting to Teams with requests: {e}")
+        return False
+    
+    # Fall back to urllib with proper encoding
+    try:
+        # Make sure we properly encode Unicode characters
+        payload = {"text": markdown_text}
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        
         req = urllib.request.Request(
             TEAMS_WEBHOOK,
             data=body,
@@ -360,193 +379,173 @@ def post_markdown_to_teams(markdown_text: str) -> bool:
             method="POST",
         )
         
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.status >= 400:
-                raise Exception(f"Teams webhook failed: {resp.status}")
-            print(f"Teams message posted successfully (status: {resp.status})")
-            return True
-            
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+            logger.info(f"Teams webhook response: status={status}")
+            return status >= 200 and status < 300
     except Exception as e:
-        print(f"TEAMS_POST_ERROR: {e}")
+        logger.error(f"Error posting to Teams webhook: {e}")
+        
+        # Last resort - try with ASCII only if it was a Unicode error
+        if isinstance(e, UnicodeEncodeError):
+            try:
+                logger.warning("Trying again with ASCII-only content")
+                # Replace Unicode characters with ASCII approximations
+                ascii_safe_md = markdown_text.encode('ascii', 'replace').decode('ascii')
+                payload = {"text": ascii_safe_md}
+                body = json.dumps(payload).encode("utf-8")
+                
+                req = urllib.request.Request(
+                    TEAMS_WEBHOOK,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    status = resp.status
+                    logger.info(f"Teams webhook ASCII fallback response: status={status}")
+                    return status >= 200 and status < 300
+            except Exception as e2:
+                logger.error(f"Error in ASCII fallback: {e2}")
+        
         return False
 
+
 # =========================
-# Lambda Handler - ENHANCED
+# Lambda Handler (Whole-day with Debug)
 # =========================
 def lambda_handler(event, context):
     """
-    Enhanced whole-day IST digest with better error handling and debugging.
+    Whole-day IST digest (body-only), with debug mode & Bedrock S3 logging.
+
+    Overrides in event:
+      - {"day_ist": "YYYY-MM-DD" | "today" | "yesterday"}  # default: today
+      - {"override_start_iso": "...Z", "override_end_iso": "...Z"}  # absolute UTC window for debugging
     """
+    logger.info(f"Starting lambda with event: {json.dumps(event or {})}")
     
-    # Validate event structure
-    if event and not isinstance(event, dict):
-        return {"error": "Event must be a dictionary", "ok": False}
+    # Build window
+    override_start = (event or {}).get("override_start_iso")
+    override_end   = (event or {}).get("override_end_iso")
+    if override_start and override_end:
+        start_utc = parse_dt(override_start)
+        end_utc   = parse_dt(override_end)
+        window_label_ist = f"{start_utc.astimezone(IST).strftime('%d %b %Y %H:%M')} - {end_utc.astimezone(IST).strftime('%H:%M')} IST"
+    else:
+        day_ist_str = (event or {}).get("day_ist")
+        start_utc, end_utc, window_label_ist = to_ist_day_bounds(day_ist_str)
 
-    try:
-        # Build time window
-        override_start = (event or {}).get("override_start_iso")
-        override_end   = (event or {}).get("override_end_iso")
+    # Fetch and filter by window
+    items = fetch_items_for_window(start_utc, end_utc)
+
+    # Intake / audit bookkeeping
+    audit = {
+        "window": window_label_ist,
+        "debug_mode": DEBUG_MODE,
+        "fetched_count": len(items),
+        "with_body_count": 0,
+        "deduped_unique_bodies": 0,
+        "forwarded_ids": [],
+        "skipped_no_body": [],
+        "dedup_groups": {},         # h -> {count, sample_ids, preview}
+        "debug_previews": []        # list of lines for Teams debug section
+    }
+
+    if not items:
+        logger.warning(f"No items found in time window {window_label_ist}")
+        md = f"**SRE Digest - {window_label_ist}**\n\n_No alert bodies found in this window._"
         
-        if override_start and override_end:
-            try:
-                start_utc = parse_dt(override_start)
-                end_utc   = parse_dt(override_end)
-                if start_utc >= end_utc:
-                    return {"error": "override_start_iso must be before override_end_iso", "ok": False}
-                window_label_ist = f"{start_utc.astimezone(IST).strftime('%d %b %Y %H:%M')} – {end_utc.astimezone(IST).strftime('%H:%M')} IST"
-            except Exception as e:
-                return {"error": f"Invalid date format in overrides: {e}", "ok": False}
-        else:
-            day_ist_str = (event or {}).get("day_ist")
-            start_utc, end_utc, window_label_ist = to_ist_day_bounds(day_ist_str)
-
-        print(f"Processing window: {window_label_ist}")
-        print(f"UTC range: {start_utc} to {end_utc}")
-
-        # Fetch and filter by window
-        items = fetch_items_for_window(start_utc, end_utc)
-
-        # Metrics
-        put_custom_metric('ItemsFetched', len(items))
-
-        # Audit tracking
-        audit = {
-            "window": window_label_ist,
-            "debug_mode": DEBUG_MODE,
-            "utc_start": iso_z(start_utc),
-            "utc_end": iso_z(end_utc),
-            "fetched_count": len(items),
-            "with_body_count": 0,
-            "deduped_unique_bodies": 0,
-            "forwarded_ids": [],
-            "skipped_no_body": [],
-            "dedup_groups": {},
-            "debug_previews": []
-        }
-
-        if not items:
-            md = f"**SRE Digest – {window_label_ist}**\n\n_No alert bodies found in this window._"
-            if DEBUG_MODE:
-                md += f"\n\n**🧪 Debug Info**\n"
-                md += f"• Window forced full-day: {DEBUG_MODE and DEBUG_FORCE_FULL_DAY}\n"
-                md += f"• UTC range: `{start_utc}` to `{end_utc}`\n"
-                md += f"• Total items scanned: {len(items)}"
+        if DEBUG_MODE:
+            md += "\n\n**Debug Information**\n"
+            md += f"- Window: {start_utc.isoformat()} to {end_utc.isoformat()} UTC\n"
+            md += "- Window forced full-day: " + ("yes" if (DEBUG_MODE and DEBUG_FORCE_FULL_DAY) else "no")
             
-            success = post_markdown_to_teams(md)
-            return {
-                "ok": True, 
-                "posted": success, 
-                "window": window_label_ist, 
-                "items_fetched": 0, 
-                "debug": DEBUG_MODE
-            }
+        post_markdown_to_teams(md)
+        return {"ok": True, "posted": True, "window": window_label_ist, "items_fetched": 0, "debug": DEBUG_MODE}
 
-        # Deduplicate by exact body content
-        by_hash: Dict[str, Dict] = {}
-        for it in items:
-            b = (it["body"] or "").strip()
-            mid = it.get("messageId", "unknown")
-            
-            if not b:
-                audit["skipped_no_body"].append(mid)
-                continue
-                
-            audit["with_body_count"] += 1
-            h = body_hash(b)
-            g = by_hash.setdefault(h, {"body": b, "ids": [], "created": []})
-            g["ids"].append(mid)
-            g["created"].append(it.get("created", ""))
+    # Deduplicate by exact body content
+    by_hash: Dict[str, Dict] = {}
+    for it in items:
+        b = (it["body"] or "").strip()
+        mid = it.get("messageId", "unknown")
+        if not b:
+            audit["skipped_no_body"].append(mid)
+            continue
+        audit["with_body_count"] += 1
+        h = body_hash(b)
+        g = by_hash.setdefault(h, {"body": b, "ids": [], "created": []})
+        g["ids"].append(mid)
+        g["created"].append(it.get("created", ""))
 
-        audit["deduped_unique_bodies"] = len(by_hash)
-        put_custom_metric('UniqueAlerts', audit["deduped_unique_bodies"])
+    audit["deduped_unique_bodies"] = len(by_hash)
+    logger.info(f"Deduplication: {audit['with_body_count']} bodies → {audit['deduped_unique_bodies']} unique")
 
-        # Prepare bodies for Bedrock
-        bodies_all = []
-        for h, g in by_hash.items():
-            bodies_all.append(g["body"])
-            if DEBUG_MODE:
-                pv = preview(g["body"], DEBUG_PREVIEW_LEN)
-                ids = ", ".join(g["ids"][:min(5, AUDIT_MAX_IDS)])
-                audit["dedup_groups"][h] = {
-                    "count": len(g["ids"]), 
-                    "sample_ids": g["ids"][:min(5, AUDIT_MAX_IDS)], 
-                    "preview": pv
-                }
-                audit["debug_previews"].append(
-                    f"• [{len(g['ids'])}×] {h}: "{pv}" IDs: {ids}{'…' if len(g['ids']) > 5 else ''}"
-                )
+    # Prepare bodies for Bedrock & collect debug preview lines
+    bodies_all = []
+    for h, g in by_hash.items():
+        bodies_all.append(g["body"])
+        if DEBUG_MODE:
+            pv = preview(g["body"], DEBUG_PREVIEW_LEN)
+            ids = ", ".join(g["ids"][:min(5, AUDIT_MAX_IDS)])
+            audit["dedup_groups"][h] = {"count": len(g["ids"]), "sample_ids": g["ids"][:min(5, AUDIT_MAX_IDS)], "preview": pv}
+            # Use hyphens instead of bullet points to avoid encoding issues
+            audit["debug_previews"].append(f"- [{len(g['ids'])}x] {h}: \"{pv}\" IDs: {ids}{'...' if len(g['ids']) > 5 else ''}")
 
-        bodies_all = normalize_body_for_bedrock(bodies_all)
+    bodies_all = normalize_body_for_bedrock(bodies_all)
 
-        # Track covered IDs
-        covered_ids = []
-        for g in by_hash.values():
-            covered_ids.extend(g["ids"])
-        audit["forwarded_ids"] = covered_ids[:AUDIT_MAX_IDS]
+    # Track covered IDs
+    covered_ids = []
+    for g in by_hash.values():
+        covered_ids.extend(g["ids"])
+    audit["forwarded_ids"] = covered_ids[:AUDIT_MAX_IDS]
 
-        # Invoke Bedrock in chunks
-        session_id = "sre-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
-        digests: List[str] = []
-        
-        for i in range(0, len(bodies_all), MAX_BODIES_PER_CALL):
-            chunk = bodies_all[i:i + MAX_BODIES_PER_CALL]
-            md = call_bedrock_agent(chunk, window_label_ist, session_id, i // MAX_BODIES_PER_CALL)
-            if md:
-                digests.append(md)
+    # Invoke Bedrock in chunks, saving logs per chunk if enabled
+    session_id = "sre-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
+    digests: List[str] = []
+    for i in range(0, len(bodies_all), MAX_BODIES_PER_CALL):
+        chunk = bodies_all[i:i + MAX_BODIES_PER_CALL]
+        md = call_bedrock_agent(chunk, window_label_ist, session_id, i // MAX_BODIES_PER_CALL)
+        if md:
+            digests.append(md)
 
-        final_md = "\n\n---\n\n".join(digests).strip()
-        if not final_md:
-            final_md = f"**SRE Digest – {window_label_ist}**\n\n_No actionable content generated from {len(bodies_all)} alert bodies._"
+    final_md = "\n\n---\n\n".join(digests).strip()
+    if not final_md:
+        final_md = f"**SRE Digest - {window_label_ist}**\n\n_No actionable items parsed from alert bodies in this window._"
 
-        # Add audit summary if enabled
-        if AUDIT_SUMMARY_IN_TEAMS:
-            def join_ids(lst):
-                return ", ".join(str(x) for x in lst[:AUDIT_MAX_IDS]) + ("..." if len(lst) > AUDIT_MAX_IDS else "")
-            
-            final_md += "\n\n---\n\n"
-            final_md += f"**🧾 Intake Summary**\n"
-            final_md += f"- Window: {audit['window']} | Debug: {'on' if DEBUG_MODE else 'off'}\n"
-            final_md += f"- Fetched: {audit['fetched_count']} | With body: {audit['with_body_count']} | Unique bodies: {audit['deduped_unique_bodies']}\n"
-            if audit["skipped_no_body"]:
-                final_md += f"- Skipped (no body): {join_ids(audit['skipped_no_body'])}\n"
-            if audit["forwarded_ids"]:
-                final_md += f"- Covered IDs: {join_ids(audit['forwarded_ids'])}\n"
+    # Optional Audit footer
+    if AUDIT_SUMMARY_IN_TEAMS:
+        def join_ids(lst):
+            return ", ".join(str(x) for x in lst[:AUDIT_MAX_IDS]) + ("..." if len(lst) > AUDIT_MAX_IDS else "")
+        final_md += "\n\n---\n\n"
+        final_md += f"**Intake Summary**\n"
+        final_md += f"- Window: {audit['window']} | Debug: {'on' if DEBUG_MODE else 'off'}\n"
+        final_md += f"- Fetched: {audit['fetched_count']} | With body: {audit['with_body_count']} | Unique bodies (dedup): {audit['deduped_unique_bodies']}\n"
+        if audit["skipped_no_body"]:
+            final_md += f"- Skipped (no body): {join_ids(audit['skipped_no_body'])}\n"
+        if audit["forwarded_ids"]:
+            final_md += f"- Covered IDs: {join_ids(audit['forwarded_ids'])}\n"
 
-        # Add debug section
-        if DEBUG_MODE and audit["debug_previews"]:
-            final_md += "\n\n**🧪 Debug (processed bodies)**\n"
-            dbg_lines = audit["debug_previews"][:AUDIT_MAX_IDS]
-            final_md += "\n".join(dbg_lines)
-            final_md += f"\n\n_UTC range: `{audit['utc_start']}` to `{audit['utc_end']}`_"
+    # Optional Debug section with previews
+    if DEBUG_MODE and audit["debug_previews"]:
+        final_md += "\n\n**Debug Information (processed bodies)**\n"
+        # Cap lines to avoid giant posts
+        dbg_lines = audit["debug_previews"][:AUDIT_MAX_IDS]
+        final_md += "\n".join(dbg_lines)
 
-        # Post to Teams
-        success = post_markdown_to_teams(final_md)
+    # Post to Teams
+    posted = post_markdown_to_teams(final_md)
 
-        # Return result
-        ret = {
-            "ok": True,
-            "posted": success,
-            "window": window_label_ist,
-            "items_fetched": audit["fetched_count"],
-            "items_with_body": audit["with_body_count"],
-            "unique_bodies_forwarded": audit["deduped_unique_bodies"],
-            "forwarded_ids_sample": audit["forwarded_ids"],
-            "debug_mode": DEBUG_MODE,
-            "audit": audit if DEBUG_MODE else None
-        }
-        
-        print("AUDIT:", json.dumps(audit, default=str)[:8000])
-        return ret
-
-    except Exception as e:
-        error_msg = f"LAMBDA_ERROR: {str(e)}"
-        print(error_msg)
-        
-        # Try to send error to Teams
-        try:
-            error_md = f"**❌ SRE Digest Error**\n\n```\n{error_msg}\n```\n\n_Check CloudWatch logs for details._"
-            post_markdown_to_teams(error_md)
-        except:
-            pass
-            
-        return {"error": error_msg, "ok": False}
+    # Return + log to CloudWatch
+    ret = {
+        "ok": True,
+        "posted": posted,
+        "window": window_label_ist,
+        "items_fetched": audit["fetched_count"],
+        "items_with_body": audit["with_body_count"],
+        "unique_bodies_forwarded": audit["deduped_unique_bodies"],
+        "forwarded_ids_sample": audit["forwarded_ids"],
+        "debug_mode": DEBUG_MODE
+    }
+    logger.info(f"AUDIT: {json.dumps({k: v for k, v in audit.items() if k not in ['debug_previews', 'dedup_groups']})}")
+    return ret
