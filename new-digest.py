@@ -202,24 +202,38 @@ def coerce_item_ts_utc(it: Dict) -> Optional[dt.datetime]:
 # =========================
 def fetch_items_for_window(start_utc: dt.datetime, end_utc: dt.datetime) -> List[Dict]:
     """
-    Full table scan (capped) + local filtering by coerce_item_ts_utc(it).
-    For production scale, use a GSI on a clean timestamp and Query.
+    Improved approach: Use pagination to fetch ALL items in the time window.
+    For production scale, consider using a GSI on timestamp field.
     """
     logger.info(f"Fetching items from DynamoDB table {DDB_TABLE}")
     items: List[Dict] = []
     
     try:
-        resp = table.scan(Limit=MAX_ITEMS)
-        items.extend(resp.get("Items", []))
-        logger.info(f"Initial scan: {len(items)} items")
+        # Remove the Limit to ensure we get all data
+        scan_kwargs = {}
         
-        while "LastEvaluatedKey" in resp and len(items) < MAX_ITEMS:
-            resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], Limit=MAX_ITEMS - len(items))
-            items.extend(resp.get("Items", []))
-            logger.info(f"Additional scan: now have {len(items)} items total")
+        while True:
+            resp = table.scan(**scan_kwargs)
+            batch_items = resp.get("Items", [])
+            items.extend(batch_items)
+            logger.info(f"Scanned batch: {len(batch_items)} items, total so far: {len(items)}")
+            
+            # Check if there are more items to scan
+            if "LastEvaluatedKey" not in resp:
+                break
+                
+            scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+            
+            # Optional safety break for very large tables
+            if len(items) > 50000:  # Adjust based on your needs
+                logger.warning(f"Hit safety limit of 50k items, breaking scan")
+                break
+                
     except Exception as e:
         logger.error(f"Error scanning DynamoDB: {e}")
         return []
+
+    logger.info(f"Total items scanned: {len(items)}")
 
     # Debug print of a sample item
     if items and DEBUG_MODE:
