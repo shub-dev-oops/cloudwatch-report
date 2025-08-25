@@ -42,6 +42,8 @@ BEDROCK_LOGS_S3_BUCKET = os.environ.get("BEDROCK_LOGS_S3_BUCKET", "")
 BEDROCK_LOGS_S3_PREFIX = os.environ.get("BEDROCK_LOGS_S3_PREFIX", "bedrock/digests/")
 LOG_ALERT_DETAIL       = os.environ.get("LOG_ALERT_DETAIL", "true").lower() == "true"
 ALERT_LOG_LIMIT        = int(os.environ.get("ALERT_LOG_LIMIT", "100"))  # max per-run detail lines
+LOG_BEDROCK_FULL       = os.environ.get("LOG_BEDROCK_FULL", "false").lower() == "true"  # log model raw output (truncated)
+BEDROCK_FULL_MAX_CHARS = int(os.environ.get("BEDROCK_FULL_MAX_CHARS", "4000"))
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -265,6 +267,21 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
     elif "message" in resp:
         out = resp["message"].get("content", "")
     out = (out or "").strip()
+
+    if LOG_BEDROCK_FULL and out:
+        # Safe truncation for CloudWatch logs
+        resp_hash = body_hash(out)
+        truncated = out[:BEDROCK_FULL_MAX_CHARS]
+        logger.info(json.dumps({
+            "tag": "BEDROCK_CHUNK_OUTPUT",
+            "chunk_index": chunk_index,
+            "chars": len(out),
+            "truncated_to": len(truncated),
+            "hash": resp_hash,
+            "preview": preview(out, 240)
+        }))
+        if len(out) > BEDROCK_FULL_MAX_CHARS:
+            logger.info(f"Bedrock chunk {chunk_index} output truncated for log (max {BEDROCK_FULL_MAX_CHARS} chars)")
 
     if SAVE_BEDROCK_LOGS and log_s3:
         try:
