@@ -40,6 +40,8 @@ DEBUG_MODE             = os.environ.get("DEBUG_MODE", "true").lower() == "true"
 SAVE_BEDROCK_LOGS      = os.environ.get("SAVE_BEDROCK_LOGS", "false").lower() == "true"
 BEDROCK_LOGS_S3_BUCKET = os.environ.get("BEDROCK_LOGS_S3_BUCKET", "")
 BEDROCK_LOGS_S3_PREFIX = os.environ.get("BEDROCK_LOGS_S3_PREFIX", "bedrock/digests/")
+LOG_ALERT_DETAIL       = os.environ.get("LOG_ALERT_DETAIL", "true").lower() == "true"
+ALERT_LOG_LIMIT        = int(os.environ.get("ALERT_LOG_LIMIT", "100"))  # max per-run detail lines
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -161,6 +163,28 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
         day += dt.timedelta(days=1)
     return alerts
 
+# ---- Debug Logging of Collected Alerts ----
+def log_alert_details(alerts: List[Dict]):
+    if not (DEBUG_MODE and LOG_ALERT_DETAIL):
+        return
+    limit = min(ALERT_LOG_LIMIT, len(alerts))
+    logger.info(f"Logging first {limit} alerts (of {len(alerts)}) for digest debug")
+    for i, a in enumerate(alerts[:limit]):
+        body_preview = preview(a.get("body", ""), 140)
+        logger.info(
+            json.dumps({
+                "tag": "ALERT_FOR_DIGEST",
+                "idx": i,
+                "messageId": a.get("messageId"),
+                "event_ts_utc": a.get("event_ts_utc"),
+                "from": a.get("fromDisplay"),
+                "body_preview": body_preview,
+                "body_hash": body_hash(a.get("body", ""))
+            })
+        )
+    if len(alerts) > limit:
+        logger.info(f"(Suppressed {len(alerts) - limit} additional alerts; increase ALERT_LOG_LIMIT to see more)")
+
 # ---- Bedrock Prompt ----
 BASE_INSTRUCTION = (
     "You are an SRE assistant generating a daily alert digest.\n"
@@ -257,6 +281,7 @@ def lambda_handler(event, context):
 
     alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
     logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
+    log_alert_details(alerts)
 
     if not alerts:
         md = f"**SRE Alert Digest - {window_label}**\n\n_No alerts/messages found in this window._"
