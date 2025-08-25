@@ -130,25 +130,42 @@ def read_jsonl_object(bucket: str, key: str):
         logger.error(f"Failed reading {key}: {e}")
 
 # ---- Collect Alerts ----
-def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) -> List[Dict]:
+def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) -> (List[Dict]):
+    """Collect alerts within time window; returns list. Detailed stats logged separately."""
     alerts: List[Dict] = []
+    stats = {
+        "objects_listed": 0,
+        "objects_read": 0,
+        "lines_scanned": 0,
+        "lines_valid": 0,
+        "lines_skipped_blank": 0,
+        "lines_skipped_time": 0,
+        "lines_parse_errors": 0,
+        "cap_hit": False,
+    }
     day = start_utc.date()
     while day <= end_utc.date():
         for key, size in iter_day_objects(ALERTS_BUCKET, day):
+            stats["objects_listed"] += 1
             if not (key.endswith('.jsonl') or key.endswith('.jsonl.gz')):
                 continue
+            stats["objects_read"] += 1
             if DEBUG_MODE:
                 logger.info(f"Reading {key} ({size} bytes)")
             for rec in read_jsonl_object(ALERTS_BUCKET, key):
+                stats["lines_scanned"] += 1
                 body = rec.get("body", "")
-                if not body.strip():
+                if not body or not body.strip():
+                    stats["lines_skipped_blank"] += 1
                     continue
                 ts_raw = rec.get("event_ts_utc") or rec.get("ingestion_ts_utc")
                 try:
                     ts = parse_dt(ts_raw) if ts_raw else None
                 except Exception:
                     ts = None
+                    stats["lines_parse_errors"] += 1
                 if ts is None or ts < start_utc or ts > end_utc:
+                    stats["lines_skipped_time"] += 1
                     continue
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
@@ -156,12 +173,24 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                     "fromDisplay": rec.get("fromDisplay") or rec.get("source") or rec.get("source_system") or "",
                     "event_ts_utc": ts_raw
                 })
+                stats["lines_valid"] += 1
                 if len(alerts) >= cap:
+                    stats["cap_hit"] = True
                     if DEBUG_MODE:
                         logger.info(f"Hit cap {cap}, stopping collection")
+                    _log_collection_stats(stats, start_utc, end_utc)
                     return alerts
         day += dt.timedelta(days=1)
+    _log_collection_stats(stats, start_utc, end_utc)
     return alerts
+
+def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime):
+    logger.info(json.dumps({
+        "tag": "DIGEST_COLLECTION_STATS",
+        "window_start_utc": iso_z(start_utc),
+        "window_end_utc": iso_z(end_utc),
+        **stats
+    }))
 
 # ---- Debug Logging of Collected Alerts ----
 def log_alert_details(alerts: List[Dict]):
@@ -278,6 +307,13 @@ def lambda_handler(event, context):
     else:
         day_ist = (event or {}).get("day_ist") or DAY_IST_DEFAULT or "today"
         start_utc, end_utc, window_label = to_ist_day_bounds(day_ist)
+
+    # Warn if legacy module file still present (could cause handler confusion)
+    try:
+        if os.path.exists(os.path.join(os.path.dirname(__file__), 's3-digest.py')):
+            logger.warning("Legacy file s3-digest.py present; ensure Lambda handler set to s3_digest.lambda_handler")
+    except Exception:
+        pass
 
     alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
     logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
