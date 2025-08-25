@@ -34,9 +34,9 @@ Daily EventBridge → Lambda (new-digest.py) → Bedrock Agent → Teams
 
 ## 🚀 **AWS Resources Setup**
 
-### 1. SQS Queue
+### 1. SQS Queue (Simple Setup)
 ```bash
-# Standard queue (simpler, cheaper)
+# Simple standard queue - easy to set up and manage
 aws sqs create-queue \
   --queue-name sre-alerts-queue \
   --attributes '{
@@ -44,34 +44,9 @@ aws sqs create-queue \
     "MessageRetentionPeriod":"1209600",
     "ReceiveMessageWaitTimeSeconds":"20"
   }'
-
-# OR FIFO queue (guaranteed ordering, deduplication)  
-aws sqs create-queue \
-  --queue-name sre-alerts-queue.fifo \
-  --attributes '{
-    "FifoQueue":"true",
-    "ContentBasedDeduplication":"true",
-    "VisibilityTimeoutSeconds":"300"
-  }'
 ```
 
-### 2. Dead Letter Queue (Recommended)
-```bash
-aws sqs create-queue \
-  --queue-name sre-alerts-dlq \
-  --attributes '{
-    "MessageRetentionPeriod":"1209600"
-  }'
-
-# Configure DLQ on main queue
-aws sqs set-queue-attributes \
-  --queue-url https://sqs.region.amazonaws.com/account/sre-alerts-queue \
-  --attributes '{
-    "RedrivePolicy":"{\"deadLetterTargetArn\":\"arn:aws:sqs:region:account:sre-alerts-dlq\",\"maxReceiveCount\":3}"
-  }'
-```
-
-### 3. S3 Bucket with Lifecycle Policy
+### 2. S3 Bucket with Lifecycle Policy
 ```bash
 aws s3 mb s3://sre-alerts-data
 

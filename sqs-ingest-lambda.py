@@ -264,14 +264,19 @@ def handler(event, context):
             }
         }
         
-        # Send message to SQS
-        response = sqs.send_message(
-            QueueUrl=SQS_QUEUE_URL,
-            MessageBody=sqs_message_body,
-            MessageAttributes=message_attributes,
-            MessageGroupId=f"{enriched_alert['product']}-{enriched_alert['environment']}" if SQS_QUEUE_URL.endswith('.fifo') else None,
-            MessageDeduplicationId=f"{message_id}-{int(time.time())}" if SQS_QUEUE_URL.endswith('.fifo') else None
-        )
+        # Build send_message kwargs (avoid sending FIFO-only params when queue is standard)
+        send_kwargs = {
+            "QueueUrl": SQS_QUEUE_URL,
+            "MessageBody": sqs_message_body,
+            "MessageAttributes": message_attributes,
+        }
+        if SQS_QUEUE_URL.endswith('.fifo'):
+            # FIFO queue requires a MessageGroupId; provide stable grouping by product-env
+            send_kwargs["MessageGroupId"] = f"{enriched_alert['product']}-{enriched_alert['environment']}" or "default"
+            # Provide a dedupe id (even if content-based dedupe enabled it's harmless)
+            send_kwargs["MessageDeduplicationId"] = f"{message_id}-{int(time.time())}"
+
+        response = sqs.send_message(**send_kwargs)
         
         logger.info(f"Successfully sent alert {message_id} to SQS. MessageId: {response['MessageId']}")
         
