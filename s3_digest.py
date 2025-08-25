@@ -44,6 +44,8 @@ LOG_ALERT_DETAIL       = os.environ.get("LOG_ALERT_DETAIL", "true").lower() == "
 ALERT_LOG_LIMIT        = int(os.environ.get("ALERT_LOG_LIMIT", "100"))  # max per-run detail lines
 LOG_BEDROCK_FULL       = os.environ.get("LOG_BEDROCK_FULL", "false").lower() == "true"  # log model raw output (truncated)
 BEDROCK_FULL_MAX_CHARS = int(os.environ.get("BEDROCK_FULL_MAX_CHARS", "4000"))
+LOG_SKIPPED_TIME       = os.environ.get("LOG_SKIPPED_TIME", "false").lower() == "true"  # log sample of time-skipped alerts
+SKIPPED_TIME_LIMIT     = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -145,6 +147,7 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
         "lines_parse_errors": 0,
         "cap_hit": False,
     }
+    skipped_time_samples = []  # capture a few examples of ts outside window
     day = start_utc.date()
     while day <= end_utc.date():
         for key, size in iter_day_objects(ALERTS_BUCKET, day):
@@ -168,6 +171,15 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                     stats["lines_parse_errors"] += 1
                 if ts is None or ts < start_utc or ts > end_utc:
                     stats["lines_skipped_time"] += 1
+                    if LOG_SKIPPED_TIME and len(skipped_time_samples) < SKIPPED_TIME_LIMIT:
+                        skipped_time_samples.append({
+                            "messageId": rec.get("messageId"),
+                            "event_ts_utc": ts_raw,
+                            "parsed": iso_z(ts) if ts else None,
+                            "reason": "null_or_outside_window",
+                            "window_start_utc": iso_z(start_utc),
+                            "window_end_utc": iso_z(end_utc)
+                        })
                     continue
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
@@ -183,16 +195,19 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                     _log_collection_stats(stats, start_utc, end_utc)
                     return alerts
         day += dt.timedelta(days=1)
-    _log_collection_stats(stats, start_utc, end_utc)
+    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
     return alerts
 
-def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime):
-    logger.info(json.dumps({
+def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
+    doc = {
         "tag": "DIGEST_COLLECTION_STATS",
         "window_start_utc": iso_z(start_utc),
         "window_end_utc": iso_z(end_utc),
         **stats
-    }))
+    }
+    if skipped_time_samples:
+        doc["skipped_time_samples"] = skipped_time_samples
+    logger.info(json.dumps(doc))
 
 # ---- Debug Logging of Collected Alerts ----
 def log_alert_details(alerts: List[Dict]):
