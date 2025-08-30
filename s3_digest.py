@@ -196,6 +196,8 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                     return alerts
         day += dt.timedelta(days=1)
     _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
+    # Store stats for debug output
+    collect_alerts_s3._last_stats = stats
     return alerts
 
 def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
@@ -311,6 +313,18 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
             log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=log_key, Body=json.dumps(log_doc).encode('utf-8'), ContentType='application/json')
         except Exception as e:
             logger.error(f"Failed saving bedrock log: {e}")
+
+    # Store response stats for debug output
+    stats = {
+        "chunk_index": chunk_index,
+        "chars": len(out),
+        "hash": body_hash(out),
+        "preview": preview(out, 240)
+    }
+    if not hasattr(invoke_bedrock, '_last_response_stats'):
+        invoke_bedrock._last_response_stats = []
+    invoke_bedrock._last_response_stats.append(stats)
+
     return out
 
 # ---- Teams Posting ----
@@ -371,7 +385,80 @@ def lambda_handler(event, context):
         final_md = f"**SRE Alert Digest - {window_label} (Multi-chunk)**\n\n" + final_md
 
     if not final_md.strip():
-        final_md = f"**SRE Alert Digest - {window_label}**\n\n_No actionable alerts identified (model returned empty response)._"
+        final_md = f"""**SRE Alert Digest - {window_label}**
+
+_No actionable alerts identified (model returned empty response)._
+
+{_build_debug_section(alerts, chunks, session_id) if DEBUG_MODE else ''}"""
+
+def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_id: str) -> str:
+    """Build debug section for Teams message when digest is empty or DEBUG_MODE."""
+    lines = [
+        "\n### Debug Information",
+        f"- Total alerts collected: {len(alerts)}",
+        f"- Chunks: {len(chunks)} (max {MAX_BODIES_PER_CALL} items per chunk)",
+        f"- Session: {session_id}",
+    ]
+    
+    # Sample what was sent (first alert from each chunk)
+    if alerts:
+        lines.extend([
+            "\n#### Sample Alerts Sent to Bedrock",
+            "```",
+            f"First {min(3, len(chunks))} chunks, first alert from each:"
+        ])
+        for idx, chunk in enumerate(chunks[:3]):
+            if not chunk:
+                continue
+            sample = chunk[0]
+            lines.extend([
+                f"\nChunk {idx} (size {len(chunk)}):",
+                f"messageId: {sample.get('messageId')}",
+                f"from: {sample.get('fromDisplay', '')}",
+                f"ts: {sample.get('event_ts_utc')}",
+                f"body: {preview(sample.get('body', ''), 200)}"
+            ])
+        lines.append("```")
+
+    # Collection stats if we have them
+    stats = getattr(collect_alerts_s3, '_last_stats', None)
+    if stats:
+        lines.extend([
+            "\n#### Collection Stats",
+            "```",
+            "objects_listed: " + str(stats.get('objects_listed', 0)),
+            "objects_read: " + str(stats.get('objects_read', 0)),
+            "lines_scanned: " + str(stats.get('lines_scanned', 0)),
+            "lines_valid: " + str(stats.get('lines_valid', 0)),
+            "lines_skipped_blank: " + str(stats.get('lines_skipped_blank', 0)),
+            "lines_skipped_time: " + str(stats.get('lines_skipped_time', 0)),
+            "```"
+        ])
+        if samples := stats.get('skipped_time_samples', []):
+            lines.extend([
+                "\n#### Time-Skipped Examples",
+                "```",
+                json.dumps(samples[:2], indent=2),
+                "```"
+            ])
+
+    # Show Bedrock response stats
+    bedrock_stats = getattr(invoke_bedrock, '_last_response_stats', [])
+    if bedrock_stats:
+        lines.extend([
+            "\n#### Bedrock Response Stats",
+            "```"
+        ])
+        for stat in bedrock_stats[:3]:  # First 3 chunks
+            lines.extend([
+                f"\nChunk {stat.get('chunk_index', '?')}:",
+                f"chars: {stat.get('chars', 0)}",
+                f"hash: {stat.get('hash', 'n/a')}",
+                f"preview: {stat.get('preview', 'n/a')}"
+            ])
+        lines.append("```")
+
+    return "\n".join(lines)
 
     posted = post_to_teams(final_md)
 
