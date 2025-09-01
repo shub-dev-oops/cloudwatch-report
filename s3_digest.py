@@ -7,15 +7,17 @@ from typing import List, Dict, Optional
 import boto3
 import urllib.request
 import hashlib
+from dateutil import tz
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # ---- ENV ----
 ALERTS_BUCKET = os.environ["ALERTS_BUCKET"]
-MODEL_ID = os.environ.get("MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+MODEL_ID = os.environ.get("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 TEAMS_WEBHOOK = os.environ["TEAMS_WEBHOOK"]
-DAY_IST_DEFAULT = os.environ.get("DAY_IST")  # optional default day
+DIGEST_INTERVAL_MINUTES = int(os.environ.get("DIGEST_INTERVAL_MINUTES", "15"))  # default 15 minutes
+OUTPUT_TIMEZONE = os.environ.get("OUTPUT_TIMEZONE", "UTC")  # default UTC
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
 MAX_BODIES_PER_CALL = int(os.environ.get("MAX_BODIES_PER_CALL", "90"))
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
@@ -34,7 +36,6 @@ s3 = boto3.client("s3")
 bedrock_rt = boto3.client("bedrock-runtime")
 log_s3 = boto3.client("s3") if SAVE_BEDROCK_LOGS and BEDROCK_LOGS_S3_BUCKET else None
 
-IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 UTC = dt.timezone.utc
 
 # ---- Custom JSON Encoder ----
@@ -67,23 +68,11 @@ def body_hash(body: str) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
 
 # ---- Window Calculation ----
-def to_ist_day_bounds(day_ist_str: Optional[str]):
-    now_ist = now_utc().astimezone(IST)
-    if not day_ist_str or day_ist_str.lower() == "today":
-        day_date = now_ist.date()
-    elif day_ist_str.lower() == "yesterday":
-        day_date = (now_ist - dt.timedelta(days=1)).date()
-    else:
-        try:
-            y, m, d = map(int, day_ist_str.split("-"))
-            day_date = dt.date(y, m, d)
-        except Exception:
-            day_date = now_ist.date()
-    start_ist = dt.datetime(day_date.year, day_date.month, day_date.day, 0, 0, 0, tzinfo=IST)
-    end_ist = start_ist + dt.timedelta(days=1) - dt.timedelta(seconds=1)
-    start_utc = start_ist.astimezone(UTC)
-    end_utc = end_ist.astimezone(UTC)
-    label = f"{start_ist.strftime('%d %b %Y 00:00')} - {end_ist.strftime('%H:%M')} IST"
+def get_window_bounds():
+    end_utc = now_utc()
+    start_utc = end_utc - dt.timedelta(minutes=DIGEST_INTERVAL_MINUTES)
+    tz_obj = tz.gettz(OUTPUT_TIMEZONE)
+    label = f"{start_utc.astimezone(tz_obj).strftime('%d %b %Y %H:%M')} - {end_utc.astimezone(tz_obj).strftime('%d %b %Y %H:%M')} {OUTPUT_TIMEZONE}"
     return start_utc, end_utc, label
 
 # ---- S3 Reading ----
@@ -231,25 +220,31 @@ BASE_INSTRUCTION = (
     "4) Produce action recommendations only when clearly actionable (capacity, stability, thresholds, follow-up).\n"
     "Rules: Do NOT hallucinate severity if absent—mark as 'unknown'. Infer only when strongly implied (e.g., 'CRITICAL', 'High memory').\n"
     "Deduplicate on near-identical bodies (ignore timestamps/IDs). Use Markdown, no HTML. Keep it crisp.\n"
-    "Output the digest in this exact format (use emojis and structure as shown, adapt content):\n"
-    "🛡️ SRE Digest Summary (Auto-updated every 15 min)\n"
-    "Timestamp: [current UTC time]\n"
-    "Source Systems: [list sources from input]\n"
-    "Teams Channels Monitored: [list channels from input if available]\n"
-    "Products Tracked: [number]\n"
+    "Output the digest in this exact format (use emojis and structure as shown, adapt content, use provided current time and interval for timestamps):\n"
+    "🛡️ SRE Digest Summary\n"
+    "Timestamp (UTC): [current UTC time] • Products Affected: [num] ([comma-separated list])\n"
     "Deduplicated Alerts/Incidents: ✅\n"
+    "📊 Summary KPIs\n"
+    "🧮 Total Alerts: [total]\n"
+    "🔴 High Severity: [high count]\n"
+    "🟡 Medium/Low Severity: [med/low count]\n"
+    "🔕 Noise Ignored: [noise count]\n"
     "[For each product:]\n"
-    "📦 Product X – [Name]\n"
-    "🔥 Incident [ID]\n"
-    "Severity: [level]\n"
-    "Message: [summary]\n"
-    "Source: [source]\n"
-    "Status: [status]\n"
-    "Occurrences: [count]\n"
-    "[Repeat for alerts: ⚠️ Alert ...]\n"
-    "📌 Only Products [list] have active items.\n"
-    "🔁 Deduplicated based on message + product + type\n"
-    "🕒 Last update: [time] – next update at [time]"
+    "📦 Product — [product name]\n"
+    "🔥 [Severity Level] Incident\n"
+    "Title: [title]\n"
+    "Severity: [emoji] [level]\n"
+    "Status: [status e.g. Open]\n"
+    "First Seen: [time UTC]\n"
+    "Last Seen: [time UTC]\n"
+    "Occurrences (grouped): [count]\n"
+    "Message Preview: [preview]…\n"
+    "[Repeat for other incidents/alerts, use ⚠️ for lower severity]\n"
+    "📝 Action Items\n"
+    "[list actions if any]\n"
+    "📎 Appendix — Grouped Alert Previews\n"
+    "[list previews]\n"
+    "🕒 Last update: [current time] – next update at [current time + interval minutes]"
 )
 
 def chunk_list(lst, n):
@@ -264,7 +259,8 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
         "event_ts_utc": a.get("event_ts_utc")
     } for a in alerts]
     system = BASE_INSTRUCTION
-    user_message = f"Window (IST): {window_label}\n\nItems:\n{json.dumps(payload_items, indent=2, cls=DateTimeEncoder)}\n\nGenerate the digest Markdown directly. Respond ONLY with the digest Markdown."
+    current_time = now_utc().strftime("%Y-%m-%d %H:%M")
+    user_message = f"Current UTC time: {current_time}\nDigest interval: {DIGEST_INTERVAL_MINUTES} minutes\nWindow: {window_label}\n\nItems:\n{json.dumps(payload_items, indent=2, cls=DateTimeEncoder)}\n\nGenerate the digest Markdown directly. Respond ONLY with the digest Markdown."
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4096,
@@ -465,15 +461,8 @@ def post_to_teams(markdown: str) -> bool:
 # ---- Lambda Handler ----
 def lambda_handler(event, context):
     logger.info(f"Digest start event={json.dumps(event or {}, cls=DateTimeEncoder)}")
-    override_start = (event or {}).get("override_start_iso")
-    override_end = (event or {}).get("override_end_iso")
-    if override_start and override_end:
-        start_utc = parse_dt(override_start)
-        end_utc = parse_dt(override_end)
-        window_label = f"{start_utc.astimezone(IST).strftime('%d %b %Y %H:%M')} - {end_utc.astimezone(IST).strftime('%H:%M')} IST"
-    else:
-        day_ist = (event or {}).get("day_ist") or DAY_IST_DEFAULT or "today"
-        start_utc, end_utc, window_label = to_ist_day_bounds(day_ist)
+    # Get window based on interval
+    start_utc, end_utc, window_label = get_window_bounds()
     # Warn if legacy module file still present (could cause handler confusion)
     try:
         if os.path.exists(os.path.join(os.path.dirname(__file__), 's3-digest.py')):
@@ -484,7 +473,7 @@ def lambda_handler(event, context):
     logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
     log_alert_details(alerts)
     if not alerts:
-        md = f"**SRE Alert Digest - {window_label}**\n\n_No alerts/messages found in this window._"
+        md = f"🛡️ SRE Digest Summary\n\n_No alerts/messages found in this window._"
         if DEBUG_MODE:
             md += _build_debug_section(alerts, [], "no-session")
         post_to_teams(md)
@@ -500,9 +489,9 @@ def lambda_handler(event, context):
         final_md = part_markdowns[0]
     else:
         final_md = ("\n\n---\n\n").join(part_markdowns)
-        final_md = f"**SRE Alert Digest - {window_label} (Multi-chunk)**\n\n" + final_md
+        final_md = f"🛡️ SRE Digest Summary - {window_label} (Multi-chunk)\n\n" + final_md
     if not final_md.strip():
-        final_md = f"**SRE Alert Digest - {window_label}** _No actionable alerts identified (model returned empty response)._ "
+        final_md = f"🛡️ SRE Digest Summary - {window_label}\n_No actionable alerts identified (model returned empty response)._ "
     if DEBUG_MODE:
         final_md += _build_debug_section(alerts, chunks, session_id)
     posted = post_to_teams(final_md)
