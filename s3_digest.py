@@ -196,7 +196,7 @@ def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datet
     }
     if skipped_time_samples:
         doc["skipped_time_samples"] = skipped_time_samples
-    logger.info(json.dumps(doc))
+    logger.info(json.dumps(doc, cls=DateTimeEncoder))
 
 # ---- Debug Logging of Collected Alerts ----
 def log_alert_details(alerts: List[Dict]):
@@ -215,7 +215,7 @@ def log_alert_details(alerts: List[Dict]):
                 "from": a.get("fromDisplay"),
                 "body_preview": body_preview,
                 "body_hash": body_hash(a.get("body", ""))
-            })
+            }, cls=DateTimeEncoder)
         )
     if len(alerts) > limit:
         logger.info(f"(Suppressed {len(alerts) - limit} additional alerts; increase ALERT_LOG_LIMIT to see more)")
@@ -252,15 +252,24 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
     if DEBUG_MODE:
         if not hasattr(invoke_bedrock, '_last_requests'):
             invoke_bedrock._last_requests = {}
-        invoke_bedrock._last_requests[chunk_index] = json.dumps(payload, indent=2)
+        invoke_bedrock._last_requests[chunk_index] = json.dumps(payload, indent=2, cls=DateTimeEncoder)
     if DEBUG_MODE and payload_items:
         logger.info(f"Bedrock chunk {chunk_index} items={len(payload_items)} sampleBody={preview(payload_items[0]['body'])}")
+    req_url = None
+    resp_url = None
+    if DEBUG_MODE and log_s3:
+        try:
+            req_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/request-chunk-{chunk_index:03d}.json"
+            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=json.dumps(payload, indent=2, cls=DateTimeEncoder).encode('utf-8'), ContentType='application/json')
+            req_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': req_key}, ExpiresIn=3600*24)
+        except Exception as e:
+            logger.error(f"Failed saving bedrock request: {e}")
     try:
         resp = agent_rt.invoke_agent(
             agentId=AGENT_ID,
             agentAliasId=AGENT_ALIAS_ID,
             sessionId=session_id,
-            inputText=json.dumps(payload),
+            inputText=json.dumps(payload, cls=DateTimeEncoder),
             enableTrace=DEBUG_MODE  # Enable trace for debugging, logs to CloudWatch
         )
         out = ""
@@ -299,7 +308,7 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
                 "truncated_to": len(truncated),
                 "hash": resp_hash,
                 "preview": preview(out, 240)
-            }))
+            }, cls=DateTimeEncoder))
             if len(out) > BEDROCK_FULL_MAX_CHARS:
                 logger.info(f"Bedrock chunk {chunk_index} output truncated for log (max {BEDROCK_FULL_MAX_CHARS} chars)")
         if SAVE_BEDROCK_LOGS and log_s3:
@@ -317,6 +326,13 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
                 log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=log_key, Body=json.dumps(log_doc, cls=DateTimeEncoder).encode('utf-8'), ContentType='application/json')
             except Exception as e:
                 logger.error(f"Failed saving bedrock log: {e}")
+        if DEBUG_MODE and log_s3:
+            try:
+                resp_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/response-chunk-{chunk_index:03d}.md"
+                log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=resp_key, Body=out.encode('utf-8'), ContentType='text/markdown')
+                resp_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': resp_key}, ExpiresIn=3600*24)
+            except Exception as e:
+                logger.error(f"Failed saving bedrock response: {e}")
         # Store response stats for debug output
         stats = {
             "chunk_index": chunk_index,
@@ -327,6 +343,14 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
         if not hasattr(invoke_bedrock, '_last_response_stats'):
             invoke_bedrock._last_response_stats = []
         invoke_bedrock._last_response_stats.append(stats)
+        # Store urls
+        if DEBUG_MODE:
+            if not hasattr(invoke_bedrock, '_last_req_urls'):
+                invoke_bedrock._last_req_urls = {}
+            invoke_bedrock._last_req_urls[chunk_index] = req_url
+            if not hasattr(invoke_bedrock, '_last_resp_urls'):
+                invoke_bedrock._last_resp_urls = {}
+            invoke_bedrock._last_resp_urls[chunk_index] = resp_url
         return out
     except Exception as e:
         logger.error(f"Bedrock invoke error: {e}")
@@ -393,6 +417,20 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
         ])
         if len(json.dumps(traces, cls=DateTimeEncoder)) > 3000:
             lines.append("(Traces truncated to 3000 chars for message size)")
+    # Full debug links
+    if DEBUG_MODE:
+        lines.append("\n#### Full Debug Files")
+        bedrock_req_urls = getattr(invoke_bedrock, '_last_req_urls', {})
+        bedrock_resp_urls = getattr(invoke_bedrock, '_last_resp_urls', {})
+        for chunk_index in sorted(bedrock_req_urls.keys()):
+            req_url = bedrock_req_urls.get(chunk_index)
+            resp_url = bedrock_resp_urls.get(chunk_index)
+            if req_url or resp_url:
+                lines.append(f"\n- Chunk {chunk_index}:")
+                if req_url:
+                    lines.append(f"  [Full Request]({req_url})")
+                if resp_url:
+                    lines.append(f"  [Full Response]({resp_url})")
     # Bedrock Request Payload (first chunk only, truncated)
     bedrock_requests = getattr(invoke_bedrock, '_last_requests', {})
     if bedrock_requests and 0 in bedrock_requests:
@@ -436,7 +474,7 @@ def post_to_teams(markdown: str) -> bool:
 
 # ---- Lambda Handler ----
 def lambda_handler(event, context):
-    logger.info(f"Digest start event={json.dumps(event or {})}")
+    logger.info(f"Digest start event={json.dumps(event or {}, cls=DateTimeEncoder)}")
     override_start = (event or {}).get("override_start_iso")
     override_end = (event or {}).get("override_end_iso")
     if override_start and override_end:
