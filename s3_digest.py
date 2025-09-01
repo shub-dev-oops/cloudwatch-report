@@ -13,8 +13,7 @@ logger.setLevel(logging.INFO)
 
 # ---- ENV ----
 ALERTS_BUCKET = os.environ["ALERTS_BUCKET"]
-AGENT_ID = os.environ["AGENT_ID"]
-AGENT_ALIAS_ID = os.environ["AGENT_ALIAS_ID"]
+MODEL_ID = os.environ.get("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 TEAMS_WEBHOOK = os.environ["TEAMS_WEBHOOK"]
 DAY_IST_DEFAULT = os.environ.get("DAY_IST")  # optional default day
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
@@ -32,7 +31,7 @@ SKIPPED_TIME_LIMIT = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
-agent_rt = boto3.client("bedrock-agent-runtime")
+bedrock_rt = boto3.client("bedrock-runtime")
 log_s3 = boto3.client("s3") if SAVE_BEDROCK_LOGS and BEDROCK_LOGS_S3_BUCKET else None
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -246,13 +245,22 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
         "body": a["body"],
         "event_ts_utc": a.get("event_ts_utc")
     } for a in alerts]
-    instruction = BASE_INSTRUCTION + "\nWindow (IST): " + window_label + "\nRespond ONLY with the digest Markdown."
-    payload = {"instruction": instruction, "items": payload_items}
+    system = BASE_INSTRUCTION
+    user_message = f"Window (IST): {window_label}\n\nItems:\n{json.dumps(payload_items, indent=2)}\n\nRespond ONLY with the digest Markdown."
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "system": system,
+        "messages": [{"role": "user", "content": user_message}],
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 250
+    })
     # Store full request payload for debug
     if DEBUG_MODE:
         if not hasattr(invoke_bedrock, '_last_requests'):
             invoke_bedrock._last_requests = {}
-        invoke_bedrock._last_requests[chunk_index] = json.dumps(payload, indent=2, cls=DateTimeEncoder)
+        invoke_bedrock._last_requests[chunk_index] = body
     if DEBUG_MODE and payload_items:
         logger.info(f"Bedrock chunk {chunk_index} items={len(payload_items)} sampleBody={preview(payload_items[0]['body'])}")
     req_url = None
@@ -260,43 +268,22 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
     if DEBUG_MODE and log_s3:
         try:
             req_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/request-chunk-{chunk_index:03d}.json"
-            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=json.dumps(payload, indent=2, cls=DateTimeEncoder).encode('utf-8'), ContentType='application/json')
+            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=body.encode('utf-8'), ContentType='application/json')
             req_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': req_key}, ExpiresIn=3600*24)
         except Exception as e:
             logger.error(f"Failed saving bedrock request: {e}")
     try:
-        resp = agent_rt.invoke_agent(
-            agentId=AGENT_ID,
-            agentAliasId=AGENT_ALIAS_ID,
-            sessionId=session_id,
-            inputText=json.dumps(payload, cls=DateTimeEncoder),
-            enableTrace=DEBUG_MODE  # Enable trace for debugging, logs to CloudWatch
+        resp = bedrock_rt.invoke_model(
+            modelId=MODEL_ID,
+            body=body
         )
-        out = ""
-        trace_logs = []
-        for event in resp.get('completion', []):
-            if 'chunk' in event:
-                chunk = event['chunk']
-                if 'bytes' in chunk:
-                    out += chunk['bytes'].decode('utf-8')
-            elif 'trace' in event:
-                trace_logs.append(event['trace'])
-                if DEBUG_MODE:
-                    logger.info(json.dumps({"tag": "BEDROCK_TRACE", "chunk_index": chunk_index, "trace": event['trace']}, cls=DateTimeEncoder))
-            elif 'exception' in event:
-                error_msg = str(event['exception'])
-                logger.error(f"Bedrock stream exception chunk {chunk_index}: {error_msg}")
-                return f"**Bedrock stream exception chunk {chunk_index}:** {error_msg}"
-        out = out.strip()
+        response_body = json.loads(resp['body'].read())
+        out = response_body.get('content', [{}])[0].get('text', "").strip()
         # Store full response for debug
         if DEBUG_MODE:
             if not hasattr(invoke_bedrock, '_last_responses'):
                 invoke_bedrock._last_responses = {}
             invoke_bedrock._last_responses[chunk_index] = out
-            if trace_logs:
-                if not hasattr(invoke_bedrock, '_last_traces'):
-                    invoke_bedrock._last_traces = {}
-                invoke_bedrock._last_traces[chunk_index] = trace_logs
         if LOG_BEDROCK_FULL and out:
             # Safe truncation for CloudWatch logs
             resp_hash = body_hash(out)
@@ -321,8 +308,6 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
                     "window": window_label,
                     "response_preview": preview(out, 400)
                 }
-                if DEBUG_MODE and trace_logs:
-                    log_doc["traces"] = trace_logs
                 log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=log_key, Body=json.dumps(log_doc, cls=DateTimeEncoder).encode('utf-8'), ContentType='application/json')
             except Exception as e:
                 logger.error(f"Failed saving bedrock log: {e}")
@@ -404,19 +389,6 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
                 f"Chunk {stat.get('chunk_index', '?')}: chars={stat.get('chars', 0)}, hash={stat.get('hash', 'n/a')}, preview={stat.get('preview', 'n/a')}\n"
             )
         lines.append("```")
-    # Bedrock Traces (first chunk only, truncated)
-    bedrock_traces = getattr(invoke_bedrock, '_last_traces', {})
-    if bedrock_traces and 0 in bedrock_traces:
-        traces = bedrock_traces[0]
-        truncated_traces = json.dumps(traces, indent=2, cls=DateTimeEncoder)[:3000]
-        lines.extend([
-            "\n#### Bedrock Stream Traces (Chunk 0, truncated)",
-            "```json\n",
-            truncated_traces,
-            "\n```"
-        ])
-        if len(json.dumps(traces, cls=DateTimeEncoder)) > 3000:
-            lines.append("(Traces truncated to 3000 chars for message size)")
     # Full debug links
     if DEBUG_MODE:
         lines.append("\n#### Full Debug Files")
