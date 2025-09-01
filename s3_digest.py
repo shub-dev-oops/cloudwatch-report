@@ -262,6 +262,13 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
 
     instruction = BASE_INSTRUCTION + "\nWindow (IST): " + window_label + "\nRespond ONLY with the digest Markdown."
     payload = {"instruction": instruction, "items": payload_items}
+    
+    # Store full request payload for debug
+    if DEBUG_MODE:
+        if not hasattr(invoke_bedrock, '_last_requests'):
+            invoke_bedrock._last_requests = {}
+        invoke_bedrock._last_requests[chunk_index] = json.dumps(payload, indent=2)
+    
     if DEBUG_MODE and payload_items:
         logger.info(f"Bedrock chunk {chunk_index} items={len(payload_items)} sampleBody={preview(payload_items[0]['body'])}")
     try:
@@ -284,6 +291,12 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
     elif "message" in resp:
         out = resp["message"].get("content", "")
     out = (out or "").strip()
+
+    # Store full response for debug
+    if DEBUG_MODE:
+        if not hasattr(invoke_bedrock, '_last_responses'):
+            invoke_bedrock._last_responses = {}
+        invoke_bedrock._last_responses[chunk_index] = out
 
     if LOG_BEDROCK_FULL and out:
         # Safe truncation for CloudWatch logs
@@ -326,70 +339,6 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
     invoke_bedrock._last_response_stats.append(stats)
 
     return out
-
-# ---- Teams Posting ----
-def post_to_teams(markdown: str) -> bool:
-    try:
-        data = json.dumps({"text": markdown}, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(TEAMS_WEBHOOK, data=data, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            code = getattr(resp, "status", 200)
-            logger.info(f"Teams post status={code}")
-            return 200 <= code < 300
-    except Exception as e:
-        logger.error(f"Teams post error: {e}")
-        return False
-
-# ---- Lambda Handler ----
-def lambda_handler(event, context):
-    logger.info(f"Digest start event={json.dumps(event or {})}")
-
-    override_start = (event or {}).get("override_start_iso")
-    override_end = (event or {}).get("override_end_iso")
-    if override_start and override_end:
-        start_utc = parse_dt(override_start)
-        end_utc = parse_dt(override_end)
-        window_label = f"{start_utc.astimezone(IST).strftime('%d %b %Y %H:%M')} - {end_utc.astimezone(IST).strftime('%H:%M')} IST"
-    else:
-        day_ist = (event or {}).get("day_ist") or DAY_IST_DEFAULT or "today"
-        start_utc, end_utc, window_label = to_ist_day_bounds(day_ist)
-
-    # Warn if legacy module file still present (could cause handler confusion)
-    try:
-        if os.path.exists(os.path.join(os.path.dirname(__file__), 's3-digest.py')):
-            logger.warning("Legacy file s3-digest.py present; ensure Lambda handler set to s3_digest.lambda_handler")
-    except Exception:
-        pass
-
-    alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
-    logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
-    log_alert_details(alerts)
-
-    if not alerts:
-        md = f"**SRE Alert Digest - {window_label}**\n\n_No alerts/messages found in this window._"
-        post_to_teams(md)
-        return {"ok": True, "posted": True, "count": 0, "window": window_label}
-
-    session_id = "s3-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
-    chunks = list(chunk_list(alerts, MAX_BODIES_PER_CALL))
-    part_markdowns: List[str] = []
-    for idx, chunk in enumerate(chunks):
-        part = invoke_bedrock(session_id, window_label, chunk, idx)
-        if part:
-            part_markdowns.append(part)
-
-    if len(part_markdowns) == 1:
-        final_md = part_markdowns[0]
-    else:
-        final_md = ("\n\n---\n\n").join(part_markdowns)
-        final_md = f"**SRE Alert Digest - {window_label} (Multi-chunk)**\n\n" + final_md
-
-    if not final_md.strip():
-        final_md = f"""**SRE Alert Digest - {window_label}**
-
-_No actionable alerts identified (model returned empty response)._
-
-{_build_debug_section(alerts, chunks, session_id) if DEBUG_MODE else ''}"""
 
 def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_id: str) -> str:
     """Build debug section for Teams message when digest is empty or DEBUG_MODE."""
@@ -458,7 +407,101 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
             ])
         lines.append("```")
 
+    # Show Bedrock Request Payload (first chunk only, truncated)
+    bedrock_requests = getattr(invoke_bedrock, '_last_requests', {})
+    if bedrock_requests and 0 in bedrock_requests:
+        request_payload = bedrock_requests[0]
+        truncated_request = request_payload[:5000]  # Truncate for Teams limit
+        lines.extend([
+            "\n#### Bedrock Request Payload (Chunk 0, truncated)",
+            "```json",
+            truncated_request,
+            "```"
+        ])
+        if len(request_payload) > 5000:
+            lines.append("(Request truncated for message size)")
+
+    # Show Bedrock Response (first chunk only, truncated)
+    bedrock_responses = getattr(invoke_bedrock, '_last_responses', {})
+    if bedrock_responses and 0 in bedrock_responses:
+        response = bedrock_responses[0]
+        truncated_response = response[:5000]  # Truncate for Teams limit
+        lines.extend([
+            "\n#### Bedrock Response (Chunk 0, truncated)",
+            "```markdown",
+            truncated_response,
+            "```"
+        ])
+        if len(response) > 5000:
+            lines.append("(Response truncated for message size)")
+
     return "\n".join(lines)
+
+# ---- Teams Posting ----
+def post_to_teams(markdown: str) -> bool:
+    try:
+        data = json.dumps({"text": markdown}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(TEAMS_WEBHOOK, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            code = getattr(resp, "status", 200)
+            logger.info(f"Teams post status={code}")
+            return 200 <= code < 300
+    except Exception as e:
+        logger.error(f"Teams post error: {e}")
+        return False
+
+# ---- Lambda Handler ----
+def lambda_handler(event, context):
+    logger.info(f"Digest start event={json.dumps(event or {})}")
+
+    override_start = (event or {}).get("override_start_iso")
+    override_end = (event or {}).get("override_end_iso")
+    if override_start and override_end:
+        start_utc = parse_dt(override_start)
+        end_utc = parse_dt(override_end)
+        window_label = f"{start_utc.astimezone(IST).strftime('%d %b %Y %H:%M')} - {end_utc.astimezone(IST).strftime('%H:%M')} IST"
+    else:
+        day_ist = (event or {}).get("day_ist") or DAY_IST_DEFAULT or "today"
+        start_utc, end_utc, window_label = to_ist_day_bounds(day_ist)
+
+    # Warn if legacy module file still present (could cause handler confusion)
+    try:
+        if os.path.exists(os.path.join(os.path.dirname(__file__), 's3-digest.py')):
+            logger.warning("Legacy file s3-digest.py present; ensure Lambda handler set to s3_digest.lambda_handler")
+    except Exception:
+        pass
+
+    alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
+    logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
+    log_alert_details(alerts)
+
+    if not alerts:
+        md = f"**SRE Alert Digest - {window_label}**\n\n_No alerts/messages found in this window._"
+        if DEBUG_MODE:
+            md += _build_debug_section(alerts, [], "no-session")
+        post_to_teams(md)
+        return {"ok": True, "posted": True, "count": 0, "window": window_label}
+
+    session_id = "s3-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
+    chunks = list(chunk_list(alerts, MAX_BODIES_PER_CALL))
+    part_markdowns: List[str] = []
+    for idx, chunk in enumerate(chunks):
+        part = invoke_bedrock(session_id, window_label, chunk, idx)
+        if part:
+            part_markdowns.append(part)
+
+    if len(part_markdowns) == 1:
+        final_md = part_markdowns[0]
+    else:
+        final_md = ("\n\n---\n\n").join(part_markdowns)
+        final_md = f"**SRE Alert Digest - {window_label} (Multi-chunk)**\n\n" + final_md
+
+    if not final_md.strip():
+        final_md = f"""**SRE Alert Digest - {window_label}**
+
+_No actionable alerts identified (model returned empty response)._
+
+{_build_debug_section(alerts, chunks, session_id) if DEBUG_MODE else ''}"""
 
     posted = post_to_teams(final_md)
 
