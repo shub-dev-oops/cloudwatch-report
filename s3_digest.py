@@ -221,17 +221,35 @@ def log_alert_details(alerts: List[Dict]):
 
 # ---- Bedrock Prompt ----
 BASE_INSTRUCTION = (
-    "You are an SRE assistant generating a daily alert digest.\n"
+    "You are an SRE assistant generating a daily alert digest from the provided input.\n"
+    "Do not call any functions or tools. Do not mention any functions or tools. Directly analyze the provided items and generate the digest.\n"
     "Input is a list of raw chat-like alert messages (potentially noisy).\n"
     "Tasks: 1) Identify which messages are actual alerts/incidents versus noise or benign info.\n"
     "2) Group similar alerts (same issue) and count occurrences.\n"
     "3) For each alert group, extract: concise title, affected product/service/env if evident, severity (explicit or inferred), \n"
     "first_seen (earliest timestamp), last_seen (latest), representative message preview (sanitize multi‑line).\n"
     "4) Produce action recommendations only when clearly actionable (capacity, stability, thresholds, follow-up).\n"
-    "5) Create sections: Summary KPIs, High Severity, Medium/Low, Noise Ignored (brief bullet of categories), Action Items, Appendix (raw grouped previews).\n"
-    "6) If NO valid alerts, state that explicitly.\n"
     "Rules: Do NOT hallucinate severity if absent—mark as 'unknown'. Infer only when strongly implied (e.g., 'CRITICAL', 'High memory').\n"
-    "Deduplicate on near-identical bodies (ignore timestamps/IDs). Use Markdown, no HTML. Keep it crisp."
+    "Deduplicate on near-identical bodies (ignore timestamps/IDs). Use Markdown, no HTML. Keep it crisp.\n"
+    "Output the digest in this exact format (use emojis and structure as shown, adapt content):\n"
+    "🛡️ SRE Digest Summary (Auto-updated every 15 min)\n"
+    "Timestamp: [current UTC time]\n"
+    "Source Systems: [list sources from input]\n"
+    "Teams Channels Monitored: [list channels from input if available]\n"
+    "Products Tracked: [number]\n"
+    "Deduplicated Alerts/Incidents: ✅\n"
+    "[For each product:]\n"
+    "📦 Product X – [Name]\n"
+    "🔥 Incident [ID]\n"
+    "Severity: [level]\n"
+    "Message: [summary]\n"
+    "Source: [source]\n"
+    "Status: [status]\n"
+    "Occurrences: [count]\n"
+    "[Repeat for alerts: ⚠️ Alert ...]\n"
+    "📌 Only Products [list] have active items.\n"
+    "🔁 Deduplicated based on message + product + type\n"
+    "🕒 Last update: [time] – next update at [time]"
 )
 
 def chunk_list(lst, n):
@@ -246,7 +264,7 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
         "event_ts_utc": a.get("event_ts_utc")
     } for a in alerts]
     system = BASE_INSTRUCTION
-    user_message = f"Window (IST): {window_label}\n\nItems:\n{json.dumps(payload_items, indent=2)}\n\nRespond ONLY with the digest Markdown."
+    user_message = f"Window (IST): {window_label}\n\nItems:\n{json.dumps(payload_items, indent=2, cls=DateTimeEncoder)}\n\nGenerate the digest Markdown directly. Respond ONLY with the digest Markdown."
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4096,
