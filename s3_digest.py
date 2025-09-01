@@ -1,19 +1,3 @@
-"""
-S3-Based Alert Digest Lambda (module name fixed: s3_digest.py)
-
-Flow:
-  EventBridge (daily) or manual invoke → this Lambda
-  Reads alert JSONL (and .jsonl.gz) files from S3 partition(s): alerts/year=YYYY/month=MM/day=DD/
-  Extracts minimal fields: messageId, body, fromDisplay (sender)
-  Sends in chunks to Bedrock Agent (AGENT_ID/ALIAS) with a strict instruction to:
-    - Identify which messages are true alerts vs noise/info
-    - Group & classify
-    - Summarize actionable items
-    - Produce Markdown digest
-  Posts digest to Teams via incoming webhook
-
-Handler: s3_digest.lambda_handler
-"""
 import os
 import json
 import gzip
@@ -28,24 +12,23 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # ---- ENV ----
-ALERTS_BUCKET          = os.environ["ALERTS_BUCKET"]
-AGENT_ID               = os.environ["AGENT_ID"]
-AGENT_ALIAS_ID         = os.environ["AGENT_ALIAS_ID"]
-TEAMS_WEBHOOK          = os.environ["TEAMS_WEBHOOK"]
-DAY_IST_DEFAULT        = os.environ.get("DAY_IST")  # optional default day
-
-MAX_ALERTS             = int(os.environ.get("MAX_ALERTS", "1500"))
-MAX_BODIES_PER_CALL    = int(os.environ.get("MAX_BODIES_PER_CALL", "90"))
-DEBUG_MODE             = os.environ.get("DEBUG_MODE", "true").lower() == "true"
-SAVE_BEDROCK_LOGS      = os.environ.get("SAVE_BEDROCK_LOGS", "false").lower() == "true"
+ALERTS_BUCKET = os.environ["ALERTS_BUCKET"]
+AGENT_ID = os.environ["AGENT_ID"]
+AGENT_ALIAS_ID = os.environ["AGENT_ALIAS_ID"]
+TEAMS_WEBHOOK = os.environ["TEAMS_WEBHOOK"]
+DAY_IST_DEFAULT = os.environ.get("DAY_IST")  # optional default day
+MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
+MAX_BODIES_PER_CALL = int(os.environ.get("MAX_BODIES_PER_CALL", "90"))
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
+SAVE_BEDROCK_LOGS = os.environ.get("SAVE_BEDROCK_LOGS", "false").lower() == "true"
 BEDROCK_LOGS_S3_BUCKET = os.environ.get("BEDROCK_LOGS_S3_BUCKET", "")
 BEDROCK_LOGS_S3_PREFIX = os.environ.get("BEDROCK_LOGS_S3_PREFIX", "bedrock/digests/")
-LOG_ALERT_DETAIL       = os.environ.get("LOG_ALERT_DETAIL", "true").lower() == "true"
-ALERT_LOG_LIMIT        = int(os.environ.get("ALERT_LOG_LIMIT", "100"))  # max per-run detail lines
-LOG_BEDROCK_FULL       = os.environ.get("LOG_BEDROCK_FULL", "false").lower() == "true"  # log model raw output (truncated)
+LOG_ALERT_DETAIL = os.environ.get("LOG_ALERT_DETAIL", "true").lower() == "true"
+ALERT_LOG_LIMIT = int(os.environ.get("ALERT_LOG_LIMIT", "100"))  # max per-run detail lines
+LOG_BEDROCK_FULL = os.environ.get("LOG_BEDROCK_FULL", "false").lower() == "true"  # log model raw output (truncated)
 BEDROCK_FULL_MAX_CHARS = int(os.environ.get("BEDROCK_FULL_MAX_CHARS", "4000"))
-LOG_SKIPPED_TIME       = os.environ.get("LOG_SKIPPED_TIME", "false").lower() == "true"  # log sample of time-skipped alerts
-SKIPPED_TIME_LIMIT     = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
+LOG_SKIPPED_TIME = os.environ.get("LOG_SKIPPED_TIME", "false").lower() == "true"  # log sample of time-skipped alerts
+SKIPPED_TIME_LIMIT = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -75,8 +58,7 @@ def preview(txt: str, n: int = 120) -> str:
     return (t[:n] + "...") if len(t) > n else t
 
 def body_hash(body: str) -> str:
-    import hashlib as _hl
-    return _hl.sha256((body or "").encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
 
 # ---- Window Calculation ----
 def to_ist_day_bounds(day_ist_str: Optional[str]):
@@ -118,15 +100,13 @@ def read_jsonl_object(bucket: str, key: str):
         obj = s3.get_object(Bucket=bucket, Key=key)
         data = obj["Body"].read()
         if key.endswith(".gz"):
-            import gzip as _gz
-            data = _gz.decompress(data)
+            data = gzip.decompress(data)
         for line_num, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                import json as _json
-                yield _json.loads(line)
+                yield json.loads(line)
             except Exception as e:
                 if DEBUG_MODE:
                     logger.warning(f"JSON parse error {key}:{line_num}: {e}")
@@ -134,7 +114,7 @@ def read_jsonl_object(bucket: str, key: str):
         logger.error(f"Failed reading {key}: {e}")
 
 # ---- Collect Alerts ----
-def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) -> (List[Dict]):
+def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) -> List[Dict]:
     """Collect alerts within time window; returns list. Detailed stats logged separately."""
     alerts: List[Dict] = []
     stats = {
@@ -192,11 +172,11 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                     stats["cap_hit"] = True
                     if DEBUG_MODE:
                         logger.info(f"Hit cap {cap}, stopping collection")
-                    _log_collection_stats(stats, start_utc, end_utc)
+                    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
+                    collect_alerts_s3._last_stats = stats
                     return alerts
         day += dt.timedelta(days=1)
     _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
-    # Store stats for debug output
     collect_alerts_s3._last_stats = stats
     return alerts
 
@@ -259,16 +239,13 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
         "body": a["body"],
         "event_ts_utc": a.get("event_ts_utc")
     } for a in alerts]
-
     instruction = BASE_INSTRUCTION + "\nWindow (IST): " + window_label + "\nRespond ONLY with the digest Markdown."
     payload = {"instruction": instruction, "items": payload_items}
-    
     # Store full request payload for debug
     if DEBUG_MODE:
         if not hasattr(invoke_bedrock, '_last_requests'):
             invoke_bedrock._last_requests = {}
         invoke_bedrock._last_requests[chunk_index] = json.dumps(payload, indent=2)
-    
     if DEBUG_MODE and payload_items:
         logger.info(f"Bedrock chunk {chunk_index} items={len(payload_items)} sampleBody={preview(payload_items[0]['body'])}")
     try:
@@ -276,69 +253,77 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
             agentId=AGENT_ID,
             agentAliasId=AGENT_ALIAS_ID,
             sessionId=session_id,
-            inputText=json.dumps(payload)
+            inputText=json.dumps(payload),
+            enableTrace=DEBUG_MODE  # Enable trace for debugging, logs to CloudWatch
         )
+        out = ""
+        trace_logs = []
+        for event in resp.get('completion', []):
+            if 'chunk' in event:
+                chunk = event['chunk']
+                if 'bytes' in chunk:
+                    out += chunk['bytes'].decode('utf-8')
+            elif 'trace' in event:
+                trace_logs.append(event['trace'])
+                if DEBUG_MODE:
+                    logger.info(json.dumps({"tag": "BEDROCK_TRACE", "chunk_index": chunk_index, "trace": event['trace']}))
+            elif 'exception' in event:
+                error_msg = str(event['exception'])
+                logger.error(f"Bedrock stream exception chunk {chunk_index}: {error_msg}")
+                return f"**Bedrock stream exception chunk {chunk_index}:** {error_msg}"
+        out = out.strip()
+        # Store full response for debug
+        if DEBUG_MODE:
+            if not hasattr(invoke_bedrock, '_last_responses'):
+                invoke_bedrock._last_responses = {}
+            invoke_bedrock._last_responses[chunk_index] = out
+            if trace_logs:
+                if not hasattr(invoke_bedrock, '_last_traces'):
+                    invoke_bedrock._last_traces = {}
+                invoke_bedrock._last_traces[chunk_index] = trace_logs
+        if LOG_BEDROCK_FULL and out:
+            # Safe truncation for CloudWatch logs
+            resp_hash = body_hash(out)
+            truncated = out[:BEDROCK_FULL_MAX_CHARS]
+            logger.info(json.dumps({
+                "tag": "BEDROCK_CHUNK_OUTPUT",
+                "chunk_index": chunk_index,
+                "chars": len(out),
+                "truncated_to": len(truncated),
+                "hash": resp_hash,
+                "preview": preview(out, 240)
+            }))
+            if len(out) > BEDROCK_FULL_MAX_CHARS:
+                logger.info(f"Bedrock chunk {chunk_index} output truncated for log (max {BEDROCK_FULL_MAX_CHARS} chars)")
+        if SAVE_BEDROCK_LOGS and log_s3:
+            try:
+                log_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/chunk-{chunk_index:03d}.json"
+                log_doc = {
+                    "ts_utc": iso_z(now_utc()),
+                    "chunk_index": chunk_index,
+                    "items_count": len(payload_items),
+                    "window": window_label,
+                    "response_preview": preview(out, 400)
+                }
+                if DEBUG_MODE and trace_logs:
+                    log_doc["traces"] = trace_logs
+                log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=log_key, Body=json.dumps(log_doc).encode('utf-8'), ContentType='application/json')
+            except Exception as e:
+                logger.error(f"Failed saving bedrock log: {e}")
+        # Store response stats for debug output
+        stats = {
+            "chunk_index": chunk_index,
+            "chars": len(out),
+            "hash": body_hash(out),
+            "preview": preview(out, 240)
+        }
+        if not hasattr(invoke_bedrock, '_last_response_stats'):
+            invoke_bedrock._last_response_stats = []
+        invoke_bedrock._last_response_stats.append(stats)
+        return out
     except Exception as e:
         logger.error(f"Bedrock invoke error: {e}")
         return f"**Bedrock error chunk {chunk_index}:** {e}"
-    out = ""
-    if isinstance(resp.get("completion"), list):
-        for ev in resp["completion"]:
-            if isinstance(ev, dict) and "data" in ev:
-                out += ev["data"]
-    elif "outputText" in resp:
-        out = resp["outputText"]
-    elif "message" in resp:
-        out = resp["message"].get("content", "")
-    out = (out or "").strip()
-
-    # Store full response for debug
-    if DEBUG_MODE:
-        if not hasattr(invoke_bedrock, '_last_responses'):
-            invoke_bedrock._last_responses = {}
-        invoke_bedrock._last_responses[chunk_index] = out
-
-    if LOG_BEDROCK_FULL and out:
-        # Safe truncation for CloudWatch logs
-        resp_hash = body_hash(out)
-        truncated = out[:BEDROCK_FULL_MAX_CHARS]
-        logger.info(json.dumps({
-            "tag": "BEDROCK_CHUNK_OUTPUT",
-            "chunk_index": chunk_index,
-            "chars": len(out),
-            "truncated_to": len(truncated),
-            "hash": resp_hash,
-            "preview": preview(out, 240)
-        }))
-        if len(out) > BEDROCK_FULL_MAX_CHARS:
-            logger.info(f"Bedrock chunk {chunk_index} output truncated for log (max {BEDROCK_FULL_MAX_CHARS} chars)")
-
-    if SAVE_BEDROCK_LOGS and log_s3:
-        try:
-            log_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/chunk-{chunk_index:03d}.json"
-            log_doc = {
-                "ts_utc": iso_z(now_utc()),
-                "chunk_index": chunk_index,
-                "items_count": len(payload_items),
-                "window": window_label,
-                "response_preview": preview(out, 400)
-            }
-            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=log_key, Body=json.dumps(log_doc).encode('utf-8'), ContentType='application/json')
-        except Exception as e:
-            logger.error(f"Failed saving bedrock log: {e}")
-
-    # Store response stats for debug output
-    stats = {
-        "chunk_index": chunk_index,
-        "chars": len(out),
-        "hash": body_hash(out),
-        "preview": preview(out, 240)
-    }
-    if not hasattr(invoke_bedrock, '_last_response_stats'):
-        invoke_bedrock._last_response_stats = []
-    invoke_bedrock._last_response_stats.append(stats)
-
-    return out
 
 def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_id: str) -> str:
     """Build debug section for Teams message when digest is empty or DEBUG_MODE."""
@@ -348,12 +333,11 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
         f"- Chunks: {len(chunks)} (max {MAX_BODIES_PER_CALL} items per chunk)",
         f"- Session: {session_id}",
     ]
-    
     # Sample what was sent (first alert from each chunk)
     if alerts:
         lines.extend([
             "\n#### Sample Alerts Sent to Bedrock",
-            "```",
+            "```\n",
             f"First {min(3, len(chunks))} chunks, first alert from each:"
         ])
         for idx, chunk in enumerate(chunks[:3]):
@@ -367,74 +351,85 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
                 f"ts: {sample.get('event_ts_utc')}",
                 f"body: {preview(sample.get('body', ''), 200)}"
             ])
-        lines.append("```")
-
+        lines.append("\n```")
     # Collection stats if we have them
     stats = getattr(collect_alerts_s3, '_last_stats', None)
     if stats:
         lines.extend([
             "\n#### Collection Stats",
-            "```",
-            "objects_listed: " + str(stats.get('objects_listed', 0)),
-            "objects_read: " + str(stats.get('objects_read', 0)),
-            "lines_scanned: " + str(stats.get('lines_scanned', 0)),
-            "lines_valid: " + str(stats.get('lines_valid', 0)),
-            "lines_skipped_blank: " + str(stats.get('lines_skipped_blank', 0)),
-            "lines_skipped_time: " + str(stats.get('lines_skipped_time', 0)),
+            "```\n",
+            f"objects_listed: {stats.get('objects_listed', 0)}\n",
+            f"objects_read: {stats.get('objects_read', 0)}\n",
+            f"lines_scanned: {stats.get('lines_scanned', 0)}\n",
+            f"lines_valid: {stats.get('lines_valid', 0)}\n",
+            f"lines_skipped_blank: {stats.get('lines_skipped_blank', 0)}\n",
+            f"lines_skipped_time: {stats.get('lines_skipped_time', 0)}\n",
             "```"
         ])
-        if samples := stats.get('skipped_time_samples', []):
-            lines.extend([
-                "\n#### Time-Skipped Examples",
-                "```",
-                json.dumps(samples[:2], indent=2),
-                "```"
-            ])
-
+    if samples := stats.get('skipped_time_samples', []):
+        lines.extend([
+            "\n#### Time-Skipped Examples",
+            "```json\n",
+            json.dumps(samples[:2], indent=2),
+            "\n```"
+        ])
     # Show Bedrock response stats
     bedrock_stats = getattr(invoke_bedrock, '_last_response_stats', [])
     if bedrock_stats:
         lines.extend([
             "\n#### Bedrock Response Stats",
-            "```"
+            "```\n"
         ])
-        for stat in bedrock_stats[:3]:  # First 3 chunks
+        for stat in bedrock_stats:
             lines.extend([
                 f"\nChunk {stat.get('chunk_index', '?')}:",
                 f"chars: {stat.get('chars', 0)}",
                 f"hash: {stat.get('hash', 'n/a')}",
                 f"preview: {stat.get('preview', 'n/a')}"
             ])
-        lines.append("```")
-
-    # Show Bedrock Request Payload (first chunk only, truncated)
+        lines.append("\n```")
+    # Show Bedrock Traces (if any)
+    bedrock_traces = getattr(invoke_bedrock, '_last_traces', {})
+    if bedrock_traces:
+        for chunk_index in sorted(bedrock_traces.keys()):
+            traces = bedrock_traces[chunk_index]
+            truncated_traces = json.dumps(traces, indent=2)[:5000]
+            lines.extend([
+                f"\n#### Bedrock Traces (Chunk {chunk_index}, truncated)",
+                "```json\n",
+                truncated_traces,
+                "\n```"
+            ])
+            if len(json.dumps(traces)) > 5000:
+                lines.append("(Traces truncated for message size)")
+    # Show Bedrock Request Payload (all chunks, truncated)
     bedrock_requests = getattr(invoke_bedrock, '_last_requests', {})
-    if bedrock_requests and 0 in bedrock_requests:
-        request_payload = bedrock_requests[0]
-        truncated_request = request_payload[:5000]  # Truncate for Teams limit
-        lines.extend([
-            "\n#### Bedrock Request Payload (Chunk 0, truncated)",
-            "```json",
-            truncated_request,
-            "```"
-        ])
-        if len(request_payload) > 5000:
-            lines.append("(Request truncated for message size)")
-
-    # Show Bedrock Response (first chunk only, truncated)
+    if bedrock_requests:
+        for chunk_index in sorted(bedrock_requests.keys()):
+            request_payload = bedrock_requests[chunk_index]
+            truncated_request = request_payload[:5000]  # Truncate for Teams limit
+            lines.extend([
+                f"\n#### Bedrock Request Payload (Chunk {chunk_index}, truncated)",
+                "```json\n",
+                truncated_request,
+                "\n```"
+            ])
+            if len(request_payload) > 5000:
+                lines.append("(Request truncated for message size)")
+    # Show Bedrock Response (all chunks, truncated)
     bedrock_responses = getattr(invoke_bedrock, '_last_responses', {})
-    if bedrock_responses and 0 in bedrock_responses:
-        response = bedrock_responses[0]
-        truncated_response = response[:5000]  # Truncate for Teams limit
-        lines.extend([
-            "\n#### Bedrock Response (Chunk 0, truncated)",
-            "```markdown",
-            truncated_response,
-            "```"
-        ])
-        if len(response) > 5000:
-            lines.append("(Response truncated for message size)")
-
+    if bedrock_responses:
+        for chunk_index in sorted(bedrock_responses.keys()):
+            response = bedrock_responses[chunk_index]
+            truncated_response = response[:5000]  # Truncate for Teams limit
+            lines.extend([
+                f"\n#### Bedrock Response (Chunk {chunk_index}, truncated)",
+                "```markdown\n",
+                truncated_response,
+                "\n```"
+            ])
+            if len(response) > 5000:
+                lines.append("(Response truncated for message size)")
     return "\n".join(lines)
 
 # ---- Teams Posting ----
@@ -453,7 +448,6 @@ def post_to_teams(markdown: str) -> bool:
 # ---- Lambda Handler ----
 def lambda_handler(event, context):
     logger.info(f"Digest start event={json.dumps(event or {})}")
-
     override_start = (event or {}).get("override_start_iso")
     override_end = (event or {}).get("override_end_iso")
     if override_start and override_end:
@@ -463,25 +457,21 @@ def lambda_handler(event, context):
     else:
         day_ist = (event or {}).get("day_ist") or DAY_IST_DEFAULT or "today"
         start_utc, end_utc, window_label = to_ist_day_bounds(day_ist)
-
     # Warn if legacy module file still present (could cause handler confusion)
     try:
         if os.path.exists(os.path.join(os.path.dirname(__file__), 's3-digest.py')):
             logger.warning("Legacy file s3-digest.py present; ensure Lambda handler set to s3_digest.lambda_handler")
     except Exception:
         pass
-
     alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
     logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
     log_alert_details(alerts)
-
     if not alerts:
         md = f"**SRE Alert Digest - {window_label}**\n\n_No alerts/messages found in this window._"
         if DEBUG_MODE:
             md += _build_debug_section(alerts, [], "no-session")
         post_to_teams(md)
         return {"ok": True, "posted": True, "count": 0, "window": window_label}
-
     session_id = "s3-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
     chunks = list(chunk_list(alerts, MAX_BODIES_PER_CALL))
     part_markdowns: List[str] = []
@@ -489,22 +479,16 @@ def lambda_handler(event, context):
         part = invoke_bedrock(session_id, window_label, chunk, idx)
         if part:
             part_markdowns.append(part)
-
     if len(part_markdowns) == 1:
         final_md = part_markdowns[0]
     else:
         final_md = ("\n\n---\n\n").join(part_markdowns)
         final_md = f"**SRE Alert Digest - {window_label} (Multi-chunk)**\n\n" + final_md
-
     if not final_md.strip():
-        final_md = f"""**SRE Alert Digest - {window_label}**
-
-_No actionable alerts identified (model returned empty response)._
-
-{_build_debug_section(alerts, chunks, session_id) if DEBUG_MODE else ''}"""
-
+        final_md = f"**SRE Alert Digest - {window_label}** _No actionable alerts identified (model returned empty response)._ "
+    if DEBUG_MODE:
+        final_md += _build_debug_section(alerts, chunks, session_id)
     posted = post_to_teams(final_md)
-
     return {
         "ok": True,
         "posted": posted,
