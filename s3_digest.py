@@ -38,6 +38,13 @@ log_s3 = boto3.client("s3") if SAVE_BEDROCK_LOGS and BEDROCK_LOGS_S3_BUCKET else
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 UTC = dt.timezone.utc
 
+# ---- Custom JSON Encoder ----
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (dt.datetime, dt.date)):
+            return o.isoformat()
+        return super().default(o)
+
 # ---- Helpers ----
 def now_utc():
     return dt.datetime.utcnow().replace(tzinfo=UTC, microsecond=0)
@@ -266,7 +273,7 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
             elif 'trace' in event:
                 trace_logs.append(event['trace'])
                 if DEBUG_MODE:
-                    logger.info(json.dumps({"tag": "BEDROCK_TRACE", "chunk_index": chunk_index, "trace": event['trace']}))
+                    logger.info(json.dumps({"tag": "BEDROCK_TRACE", "chunk_index": chunk_index, "trace": event['trace']}, cls=DateTimeEncoder))
             elif 'exception' in event:
                 error_msg = str(event['exception'])
                 logger.error(f"Bedrock stream exception chunk {chunk_index}: {error_msg}")
@@ -307,7 +314,7 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
                 }
                 if DEBUG_MODE and trace_logs:
                     log_doc["traces"] = trace_logs
-                log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=log_key, Body=json.dumps(log_doc).encode('utf-8'), ContentType='application/json')
+                log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=log_key, Body=json.dumps(log_doc, cls=DateTimeEncoder).encode('utf-8'), ContentType='application/json')
             except Exception as e:
                 logger.error(f"Failed saving bedrock log: {e}")
         # Store response stats for debug output
@@ -326,54 +333,42 @@ def invoke_bedrock(session_id: str, window_label: str, alerts: List[Dict], chunk
         return f"**Bedrock error chunk {chunk_index}:** {e}"
 
 def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_id: str) -> str:
-    """Build debug section for Teams message when digest is empty or DEBUG_MODE."""
+    """Build tightened debug section for Teams message, focusing on samples and first chunk for input/output."""
     lines = [
         "\n### Debug Information",
         f"- Total alerts collected: {len(alerts)}",
         f"- Chunks: {len(chunks)} (max {MAX_BODIES_PER_CALL} items per chunk)",
         f"- Session: {session_id}",
     ]
-    # Sample what was sent (first alert from each chunk)
+    # Sample alerts sent (first alert from first chunk only, and a few bodies)
     if alerts:
         lines.extend([
-            "\n#### Sample Alerts Sent to Bedrock",
+            "\n#### Sample Alerts Sent to Bedrock (First Chunk)",
             "```\n",
-            f"First {min(3, len(chunks))} chunks, first alert from each:"
         ])
-        for idx, chunk in enumerate(chunks[:3]):
-            if not chunk:
-                continue
-            sample = chunk[0]
-            lines.extend([
-                f"\nChunk {idx} (size {len(chunk)}):",
-                f"messageId: {sample.get('messageId')}",
-                f"from: {sample.get('fromDisplay', '')}",
-                f"ts: {sample.get('event_ts_utc')}",
-                f"body: {preview(sample.get('body', ''), 200)}"
-            ])
-        lines.append("\n```")
-    # Collection stats if we have them
+        if chunks:
+            chunk = chunks[0]
+            if chunk:
+                lines.append(f"Chunk 0 (size {len(chunk)}): First 3 samples\n")
+                for sample in chunk[:3]:
+                    lines.extend([
+                        f"messageId: {sample.get('messageId')}",
+                        f"from: {sample.get('fromDisplay', '')}",
+                        f"ts: {sample.get('event_ts_utc')}",
+                        f"body: {preview(sample.get('body', ''), 200)}\n"
+                    ])
+        lines.append("```")
+    # Collection stats (summary only)
     stats = getattr(collect_alerts_s3, '_last_stats', None)
     if stats:
         lines.extend([
-            "\n#### Collection Stats",
+            "\n#### Collection Stats Summary",
             "```\n",
-            f"objects_listed: {stats.get('objects_listed', 0)}\n",
-            f"objects_read: {stats.get('objects_read', 0)}\n",
-            f"lines_scanned: {stats.get('lines_scanned', 0)}\n",
-            f"lines_valid: {stats.get('lines_valid', 0)}\n",
-            f"lines_skipped_blank: {stats.get('lines_skipped_blank', 0)}\n",
-            f"lines_skipped_time: {stats.get('lines_skipped_time', 0)}\n",
+            f"Objects: listed={stats.get('objects_listed', 0)}, read={stats.get('objects_read', 0)}\n",
+            f"Lines: scanned={stats.get('lines_scanned', 0)}, valid={stats.get('lines_valid', 0)}, skipped_blank={stats.get('lines_skipped_blank', 0)}, skipped_time={stats.get('lines_skipped_time', 0)}\n",
             "```"
         ])
-    if samples := stats.get('skipped_time_samples', []):
-        lines.extend([
-            "\n#### Time-Skipped Examples",
-            "```json\n",
-            json.dumps(samples[:2], indent=2),
-            "\n```"
-        ])
-    # Show Bedrock response stats
+    # Bedrock response stats (all chunks, brief)
     bedrock_stats = getattr(invoke_bedrock, '_last_response_stats', [])
     if bedrock_stats:
         lines.extend([
@@ -381,55 +376,49 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
             "```\n"
         ])
         for stat in bedrock_stats:
-            lines.extend([
-                f"\nChunk {stat.get('chunk_index', '?')}:",
-                f"chars: {stat.get('chars', 0)}",
-                f"hash: {stat.get('hash', 'n/a')}",
-                f"preview: {stat.get('preview', 'n/a')}"
-            ])
-        lines.append("\n```")
-    # Show Bedrock Traces (if any)
+            lines.append(
+                f"Chunk {stat.get('chunk_index', '?')}: chars={stat.get('chars', 0)}, hash={stat.get('hash', 'n/a')}, preview={stat.get('preview', 'n/a')}\n"
+            )
+        lines.append("```")
+    # Bedrock Traces (first chunk only, truncated)
     bedrock_traces = getattr(invoke_bedrock, '_last_traces', {})
-    if bedrock_traces:
-        for chunk_index in sorted(bedrock_traces.keys()):
-            traces = bedrock_traces[chunk_index]
-            truncated_traces = json.dumps(traces, indent=2)[:5000]
-            lines.extend([
-                f"\n#### Bedrock Traces (Chunk {chunk_index}, truncated)",
-                "```json\n",
-                truncated_traces,
-                "\n```"
-            ])
-            if len(json.dumps(traces)) > 5000:
-                lines.append("(Traces truncated for message size)")
-    # Show Bedrock Request Payload (all chunks, truncated)
+    if bedrock_traces and 0 in bedrock_traces:
+        traces = bedrock_traces[0]
+        truncated_traces = json.dumps(traces, indent=2, cls=DateTimeEncoder)[:3000]
+        lines.extend([
+            "\n#### Bedrock Stream Traces (Chunk 0, truncated)",
+            "```json\n",
+            truncated_traces,
+            "\n```"
+        ])
+        if len(json.dumps(traces, cls=DateTimeEncoder)) > 3000:
+            lines.append("(Traces truncated to 3000 chars for message size)")
+    # Bedrock Request Payload (first chunk only, truncated)
     bedrock_requests = getattr(invoke_bedrock, '_last_requests', {})
-    if bedrock_requests:
-        for chunk_index in sorted(bedrock_requests.keys()):
-            request_payload = bedrock_requests[chunk_index]
-            truncated_request = request_payload[:5000]  # Truncate for Teams limit
-            lines.extend([
-                f"\n#### Bedrock Request Payload (Chunk {chunk_index}, truncated)",
-                "```json\n",
-                truncated_request,
-                "\n```"
-            ])
-            if len(request_payload) > 5000:
-                lines.append("(Request truncated for message size)")
-    # Show Bedrock Response (all chunks, truncated)
+    if bedrock_requests and 0 in bedrock_requests:
+        request_payload = bedrock_requests[0]
+        truncated_request = request_payload[:3000]  # Tighten truncation
+        lines.extend([
+            "\n#### Bedrock Exact Input (Chunk 0, truncated)",
+            "```json\n",
+            truncated_request,
+            "\n```"
+        ])
+        if len(request_payload) > 3000:
+            lines.append("(Input truncated to 3000 chars for message size)")
+    # Bedrock Response (first chunk only, truncated)
     bedrock_responses = getattr(invoke_bedrock, '_last_responses', {})
-    if bedrock_responses:
-        for chunk_index in sorted(bedrock_responses.keys()):
-            response = bedrock_responses[chunk_index]
-            truncated_response = response[:5000]  # Truncate for Teams limit
-            lines.extend([
-                f"\n#### Bedrock Response (Chunk {chunk_index}, truncated)",
-                "```markdown\n",
-                truncated_response,
-                "\n```"
-            ])
-            if len(response) > 5000:
-                lines.append("(Response truncated for message size)")
+    if bedrock_responses and 0 in bedrock_responses:
+        response = bedrock_responses[0]
+        truncated_response = response[:3000]  # Tighten truncation
+        lines.extend([
+            "\n#### Bedrock Exact Output (Chunk 0, truncated)",
+            "```markdown\n",
+            truncated_response,
+            "\n```"
+        ])
+        if len(response) > 3000:
+            lines.append("(Output truncated to 3000 chars for message size)")
     return "\n".join(lines)
 
 # ---- Teams Posting ----
