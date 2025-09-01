@@ -17,7 +17,7 @@ logger.setLevel(logging.INFO)
 ALERTS_BUCKET = os.environ["ALERTS_BUCKET"]
 MODEL_ID = os.environ.get("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 TEAMS_WEBHOOK = os.environ["TEAMS_WEBHOOK"]
-DIGEST_INTERVAL_MINUTES = int(os.environ.get("DIGEST_INTERVAL_MINUTES", "15000"))  # default 15 minutes
+DIGEST_INTERVAL_MINUTES = int(os.environ.get("DIGEST_INTERVAL_MINUTES", "15"))  # default 15 minutes
 OUTPUT_TIMEZONE = os.environ.get("OUTPUT_TIMEZONE", "UTC")  # default UTC
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
 MAX_BODIES_PER_CALL = int(os.environ.get("MAX_BODIES_PER_CALL", "90"))
@@ -289,23 +289,23 @@ def log_alert_details(alerts: List[Dict]):
 
 BASE_INSTRUCTION_TMPL = (
     "You are an SRE assistant generating a periodic alert digest from the provided input.\n"
-    "Write professional, crisp Markdown with proper  No HTML.\n"
+    "Write professional, crisp Markdown. No HTML.\n"
     "Tasks: 1) Identify real alerts vs noise. 2) Group similar alerts and count occurrences.\n"
     "3) For each group, extract: title, product/service/env, severity (explicit or unknown), first_seen, last_seen, preview.\n"
     "Rules: Do NOT invent severity. Use given times. Deduplicate near-identical bodies.\n"
     "Format exactly:\n"
-    "# 🛡️ SRE Digest Summary\n  \"
-    "Timestamp ({output_tz}): [current local time] • Products Affected: [num] ([comma list])\n  \"
-    "Deduplicated Alerts/Incidents: ✅\n  \"
-    "📊 Summary KPIs\n  \"
-    "🧮 Total Alerts: [total]\n  \"
-    "🔴 High Severity: [high]\n  \"
-    "🟡 Medium/Low Severity: [med_low]\n  \"
-    "🔕 Noise Ignored: [noise]\n  \"
-    "[Per product sections...]\n  \"
-    "##📝 Action Items\n  \"
-    "[list]\n  \"
-    "📎 Appendix — Grouped Alert Previews\n  \"
+    "# 🛡️ SRE Digest Summary\n"
+    "Timestamp ({output_tz}): [current local time] • Products Affected: [num] ([comma list])\n"
+    "Deduplicated Alerts/Incidents: ✅\n"
+    "📊 Summary KPIs\n"
+    "🧮 Total Alerts: [total]\n"
+    "🔴 High Severity: [high]\n"
+    "🟡 Medium/Low Severity: [med_low]\n"
+    "🔕 Noise Ignored: [noise]\n"
+    "[Per product sections...]\n"
+    "📝 Action Items\n"
+    "[list]\n"
+    "📎 Appendix — Grouped Alert Previews\n"
     "[list]\n"
     "🕒 Last update: [current local time] – next update at [next local time]\n"
 )
@@ -378,7 +378,9 @@ def invoke_bedrock(session_id: str,
     try:
         resp = bedrock_rt.invoke_model(
             modelId=MODEL_ID,
-            body=body
+            body=body.encode('utf-8'),  # send bytes; avoid Latin-1 re-encode
+            contentType='application/json',
+            accept='application/json'
         )
         response_body = json.loads(resp['body'].read())
         out = response_body.get('content', [{}])[0].get('text', "").strip()
@@ -540,7 +542,7 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
 def post_to_teams(markdown: str) -> bool:
     try:
         data = json.dumps({"text": markdown}, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(TEAMS_WEBHOOK, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        req = urllib.request.Request(TEAMS_WEBHOOK, data=data, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
         with urllib.request.urlopen(req, timeout=10) as resp:
             code = getattr(resp, "status", 200)
             logger.info(f"Teams post status={code}")
@@ -582,7 +584,7 @@ def lambda_handler(event, context):
     log_alert_details(alerts)
 
     if not alerts:
-        md = f"# 🛡️ SRE Digest Summary\n\n_No alerts/messages found in this window._"
+        md = f"🛡️ SRE Digest Summary\n\n_No alerts/messages found in this window._"
         if DEBUG_MODE:
             md += _build_debug_section(alerts, [], "no-session")
         post_to_teams(md)
@@ -617,10 +619,10 @@ def lambda_handler(event, context):
         final_md = part_markdowns[0]
     else:
         final_md = ("\n\n---\n\n").join(part_markdowns)
-        final_md = f"# 🛡️ SRE Digest Summary - {window_label} (Multi-chunk)\n\n" + final_md
+        final_md = f"🛡️ SRE Digest Summary - {window_label} (Multi-chunk)\n\n" + final_md
 
     if not final_md.strip():
-        final_md = f"# 🛡️ SRE Digest Summary - {window_label}\n_No actionable alerts identified (model returned empty response)._ "
+        final_md = f"🛡️ SRE Digest Summary - {window_label}\n_No actionable alerts identified (model returned empty response)._ "
     if DEBUG_MODE:
         final_md += _build_debug_section(alerts, chunks, session_id)
 
