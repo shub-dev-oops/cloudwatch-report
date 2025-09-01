@@ -13,7 +13,7 @@ logger.setLevel(logging.INFO)
 
 # ---- ENV ----
 ALERTS_BUCKET = os.environ["ALERTS_BUCKET"]
-MODEL_ID = os.environ.get("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+MODEL_ID = os.environ.get("MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
 TEAMS_WEBHOOK = os.environ["TEAMS_WEBHOOK"]
 DAY_IST_DEFAULT = os.environ.get("DAY_IST")  # optional default day
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
