@@ -4,5 +4,7 @@
   "channelId": "@{triggerOutputs()?['body/channelId']}",
   "createdDateTime": "@{triggerOutputs()?['body/createdDateTime']}",
   "fromDisplay": "@{triggerOutputs()?['body/from/user/displayName']}",
-  "text": "@{triggerOutputs()?['body/body/content']}"
+  "text": "@{triggerOutputs()?['body/body/content']}",
+  "channelName": "@{body('Get_channel_details')?['displayName']}"
+
 }

@@ -38,6 +38,14 @@ DIGEST_STATE_KEY = os.environ.get("DIGEST_STATE_KEY", "state/sre-digest-state.js
 USE_PREV_WINDOW = os.environ.get("USE_PREV_WINDOW", "true").lower() == "true"
 MAX_CATCHUP_MINUTES = int(os.environ.get("MAX_CATCHUP_MINUTES", "180"))
 
+# Channel-driven severity (no severity field needed)
+# Exact channel names (comma-separated). If empty, only substring hints are used.
+CRITICAL_CHANNELS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNELS", "").split(",") if t.strip()]
+WARNING_CHANNELS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNELS", "").split(",") if t.strip()]
+# Substring hints (case-insensitive) used when exact channel lists are not exhaustive
+CRITICAL_CHANNEL_HINTS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNEL_HINTS", "critical,crit,sev1,p1,urgent").split(",") if t.strip()]
+WARNING_CHANNEL_HINTS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNEL_HINTS", "warning,warn,sev2,p2,alert").split(",") if t.strip()]
+
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
 bedrock_rt = boto3.client("bedrock-runtime")
@@ -56,7 +64,7 @@ class DateTimeEncoder(json.JSONEncoder):
 def now_utc():
     return dt.datetime.utcnow().replace(tzinfo=UTC, microsecond=0)
 
-def iso_z(ts: dt.datetime) -> str:
+def iso_z(ts: dt.datetime) -> Optional[str]:
     if ts is None:
         return None
     if ts.tzinfo is None:
@@ -92,6 +100,37 @@ def preview(txt: str, n: int = 120) -> str:
 
 def body_hash(body: str) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
+
+# ---- Channel-based Severity ----
+
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+
+def derive_severity(rec: Dict) -> str:
+    """Return one of: 'Critical', 'Warning', 'Info', 'Unknown'.
+    Only uses channel names / source names; no body inference, no severity field.
+    """
+    # Gather possible channel/source fields
+    ch_name = _norm(rec.get("channel"))
+    channelish = " ".join(filter(None, [
+        rec.get("channel"), rec.get("teams_channel"), rec.get("fromDisplay"),
+        rec.get("source"), rec.get("source_system"), rec.get("team"), rec.get("room")
+    ])).lower()
+
+    # Exact channel match first (if provided)
+    if CRITICAL_CHANNELS and ch_name in CRITICAL_CHANNELS:
+        return "Critical"
+    if WARNING_CHANNELS and ch_name in WARNING_CHANNELS:
+        return "Warning"
+
+    # Otherwise use substring hints
+    if any(h in channelish for h in CRITICAL_CHANNEL_HINTS):
+        return "Critical"
+    if any(h in channelish for h in WARNING_CHANNEL_HINTS):
+        return "Warning"
+
+    return "Unknown"
 
 # ---- State (S3) ----
 
@@ -231,11 +270,14 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                             "window_end_utc": iso_z(end_utc)
                         })
                     continue
+                norm_sev = derive_severity({**rec, "body": body})
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
                     "body": body,
                     "fromDisplay": rec.get("fromDisplay") or rec.get("source") or rec.get("source_system") or "",
-                    "event_ts_utc": ts_raw
+                    "channel": rec.get("channel"),
+                    "event_ts_utc": ts_raw,
+                    "norm_severity": norm_sev
                 })
                 stats["lines_valid"] += 1
                 if len(alerts) >= cap:
@@ -278,6 +320,8 @@ def log_alert_details(alerts: List[Dict]):
                 "messageId": a.get("messageId"),
                 "event_ts_utc": a.get("event_ts_utc"),
                 "from": a.get("fromDisplay"),
+                "channel": a.get("channel"),
+                "norm_severity": a.get("norm_severity"),
                 "body_preview": body_preview,
                 "body_hash": body_hash(a.get("body", ""))
             }, cls=DateTimeEncoder)
@@ -291,18 +335,27 @@ BASE_INSTRUCTION_TMPL = (
     "You are an SRE assistant generating a periodic alert digest from the provided input.\n"
     "Write professional, crisp Markdown. No HTML.\n"
     "Tasks: 1) Identify real alerts vs noise. 2) Group similar alerts and count occurrences.\n"
-    "3) For each group, extract: title, product/service/env, severity (explicit or unknown), first_seen, last_seen, preview.\n"
-    "Rules: Do NOT invent severity. Use given times. Deduplicate near-identical bodies.\n"
+    "3) For each group, extract: title, product/service/env, severity (use provided normalized_severity), first_seen, last_seen, preview.\n"
+    "Rules: Use the provided 'normalized_severity' per item when present ('Critical', 'Warning', 'Info', 'Unknown'). Do NOT rename to High/Medium.\n"
     "Format exactly:\n"
     "# 🛡️ SRE Digest Summary\n"
     "Timestamp ({output_tz}): [current local time] • Products Affected: [num] ([comma list])\n"
     "Deduplicated Alerts/Incidents: ✅\n"
     "📊 Summary KPIs\n"
-    "🧮 Total Alerts: [total]\n"
-    "🔴 High Severity: [high]\n"
-    "🟡 Medium/Low Severity: [med_low]\n"
+    "🔴 Critical: [count]\n"
+    "🟠 Warning: [count]\n"
+    "🔵 Info/Other: [count]\n"
     "🔕 Noise Ignored: [noise]\n"
     "[Per product sections...]\n"
+    "📦 Product — [product name]\n"
+    "🔥 Incident/Alert\n"
+    "Title: [title]\n"
+    "Severity: [emoji] [Critical|Warning|Info|Unknown]\n"
+    "Status: [status]\n"
+    "First Seen: [time UTC]\n"
+    "Last Seen: [time UTC]\n"
+    "Occurrences (grouped): [count]\n"
+    "Message Preview: [preview]…\n"
     "📝 Action Items\n"
     "[list]\n"
     "📎 Appendix — Grouped Alert Previews\n"
@@ -330,7 +383,8 @@ def invoke_bedrock(session_id: str,
         "messageId": a["messageId"],
         "from": a.get("fromDisplay", ""),
         "body": a["body"],
-        "event_ts_utc": a.get("event_ts_utc")
+        "event_ts_utc": a.get("event_ts_utc"),
+        "normalized_severity": a.get("norm_severity")
     } for a in alerts]
 
     system = BASE_INSTRUCTION_TMPL.format(output_tz=output_tz_name)
@@ -470,6 +524,8 @@ def _build_debug_section(alerts: List[Dict], chunks: List[List[Dict]], session_i
                         f"messageId: {sample.get('messageId')}",
                         f"from: {sample.get('fromDisplay', '')}",
                         f"ts: {sample.get('event_ts_utc')}",
+                        f"channel: {sample.get('channel')}",
+                        f"sev: {sample.get('norm_severity')}",
                         f"body: {preview(sample.get('body', ''), 200)}\n"
                     ])
         lines.append("```")
