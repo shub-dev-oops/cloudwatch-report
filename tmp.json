@@ -5,6 +5,6 @@
   "createdDateTime": "@{triggerOutputs()?['body/createdDateTime']}",
   "fromDisplay": "@{triggerOutputs()?['body/from/user/displayName']}",
   "text": "@{triggerOutputs()?['body/body/content']}",
-  "channelName": "@{body('Get_channel_details')?['displayName']}"
-
+  "textPlain": "@{outputs('Get_message_details')?['body/body/plainTextContent']}",
+  "textHtml": "@{triggerOutputs()?['body/body/content']}"
 }
