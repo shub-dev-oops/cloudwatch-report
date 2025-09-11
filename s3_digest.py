@@ -134,26 +134,30 @@ def _norm(s: Optional[str]) -> str:
 
 
 def derive_severity(rec: Dict) -> str:
-    # 1) Respect explicit normalized_severity if provided by upstream
-    explicit = _norm(rec.get("normalized_severity"))
+    ch_name = (rec.get("channel") or "").strip().lower()
+
+    # 1) Explicit channel → severity mapping from env vars
+    if ch_name in CRITICAL_CHANNELS:
+        return "Critical"
+    if ch_name in WARNING_CHANNELS:
+        return "Warning"
+
+    # 2) Fallback to normalized_severity from upstream
+    explicit = (rec.get("normalized_severity") or "").strip().lower()
     if explicit in {"critical", "warning", "info"}:
         return explicit.capitalize()
 
-    # 2) Otherwise infer from channel names/hints
-    ch_name = _norm(rec.get("channel"))
+    # 3) Fallback to hints (critical/warning substrings in channel names)
     channelish = " ".join(filter(None, [
         rec.get("channel"), rec.get("teams_channel"), rec.get("fromDisplay"),
         rec.get("source"), rec.get("source_system"), rec.get("team"), rec.get("room")
     ])).lower()
 
-    if CRITICAL_CHANNELS and ch_name in CRITICAL_CHANNELS:
-        return "Critical"
-    if WARNING_CHANNELS and ch_name in WARNING_CHANNELS:
-        return "Warning"
     if any(h in channelish for h in CRITICAL_CHANNEL_HINTS):
         return "Critical"
     if any(h in channelish for h in WARNING_CHANNEL_HINTS):
         return "Warning"
+
     return "Unknown"
 
 
@@ -357,7 +361,7 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                             "window_end_utc": iso_z(end_utc)
                         })
                     continue
-                norm_sev = derive_severity({**rec, "body": body})
+                norm_sev = derive_severity(rec)
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
                     "body": body,
@@ -659,7 +663,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
     next_local = fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), tz_obj)
 
     lines: List[str] = []
-    _add(lines, "# 🛡️ SRE Digest")
+    _add(lines, "🛡️ #SRE Digest")
     _add(lines)
     _add(lines, f"**Timestamp ({OUTPUT_TIMEZONE}):** {now_local}")
     _add(lines, f"**Window:** {window_label}")
@@ -668,6 +672,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
 
     k = agg.get("kpis", {})
     _add(lines, "## Summary KPIs")
+    _add(lines, f"- **🧮 Total alerts:** {k.get('total_alerts', 0)} (raw count)")
     _add(lines, f"- **🔴 Critical:** {k.get('critical', 0)}")
     _add(lines, f"- **🟠 Warning:** {k.get('warning', 0)}")
     _add(lines, f"- **🔵 Info:** {k.get('info', 0)}")
@@ -699,7 +704,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             mags = ent.get("swagit_mag_ids") or []
             hosts = ent.get("affected_hosts") or []
 
-            _add(lines, f"#### {emoji} {title}")
+            _add(lines, f"**{emoji} {title}**")
             _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
             _add(lines, f"- **Component:** _{component}_")
             if nodes:
@@ -754,6 +759,7 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
 
     k = agg.get("kpis", {})
     _add(lines, "**Summary**")
+    _add(lines, f"- **🧮 Total alerts:** {k.get('total_alerts', 0)} (raw count)")
     _add(lines, f"- 🔴 Critical: {k.get('critical', 0)}")
     _add(lines, f"- 🟠 Warning: {k.get('warning', 0)}")
     _add(lines, f"- 🔵 Info: {k.get('info', 0)}")
