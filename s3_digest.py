@@ -554,7 +554,12 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             nodes = ent.get("rebooted_nodes") or []
             mags = ent.get("swagit_mag_ids") or []
 
-            _add(lines, f"**{emoji} {title}**")
+            is_gm, canon = is_govmeetings_product(product)
+            if is_gm:
+                display_title = f"GovMeetings - {product}: {title}"
+            else:
+                display_title = f"{product} - {title}" if product not in {"Unknown", ""} else title
+            _add(lines, f"**{emoji} {display_title}**")
             _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
             _add(lines, f"- **Component:** _{component}_")
             if hosts: _add(lines, f"- **Affected Hosts:** {', '.join(hosts[:10])}")
@@ -635,8 +640,17 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
             ent = g.get("entities") or {}
             hosts = ent.get("affected_hosts") or []
             host_txt = f" • Hosts: {', '.join(hosts[:5])}" if hosts else ""
-            _add(lines, f"- {emoji} **{title}** — {summ}{host_txt}  _(x{occ}; {fs} → {ls})_")
+
+            # >>> NEW: prefix titles for GovMeetings family <<<
+            is_gm, _canon = is_govmeetings_product(product)
+            if is_gm:
+                display_title = f"GovMeetings - {product}: {title}"
+            else:
+                display_title = title
+
+            _add(lines, f"- {emoji} **{display_title}** — {summ}{host_txt}  _(x{occ}; {fs} → {ls})_")
         _add(lines, "")
+
 
     md = "\n".join(lines).strip()
     if len(md) > TEAMS_MAX_CHARS:
