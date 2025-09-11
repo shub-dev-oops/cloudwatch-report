@@ -3,7 +3,7 @@ import json
 import gzip
 import logging
 import datetime as dt
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import boto3
 import urllib.request
 import hashlib
@@ -52,7 +52,7 @@ MAX_CATCHUP_MINUTES = int(os.environ.get("MAX_CATCHUP_MINUTES", "180"))
 # Teams output mode
 TEAMS_MAX_CHARS = int(os.environ.get("TEAMS_MAX_CHARS", "24000"))  # safety cap
 
-# Channel-driven severity (no severity field needed)
+# Channel-driven severity via ENV (names are compared case-insensitively)
 CRITICAL_CHANNELS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNELS", "").split(",") if t.strip()]
 WARNING_CHANNELS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNELS", "").split(",") if t.strip()]
 CRITICAL_CHANNEL_HINTS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNEL_HINTS", "critical,crit,sev1,p1,urgent").split(",") if t.strip()]
@@ -64,6 +64,11 @@ try:
     PRODUCT_ALIASES: Dict[str, str] = json.loads(PRODUCT_ALIAS_JSON)
 except Exception:
     PRODUCT_ALIASES = {}
+
+# GovMeetings product family (for listing)
+GOVMEETINGS_PRODUCTS = {
+    "onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit"
+}
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -84,7 +89,6 @@ class DateTimeEncoder(json.JSONEncoder):
 def now_utc():
     return dt.datetime.utcnow().replace(tzinfo=UTC, microsecond=0)
 
-
 def iso_z(ts: Optional[dt.datetime]) -> Optional[str]:
     if ts is None:
         return None
@@ -92,32 +96,25 @@ def iso_z(ts: Optional[dt.datetime]) -> Optional[str]:
         ts = ts.replace(tzinfo=UTC)
     return ts.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-# Timezone helpers
-
 def get_output_tz():
     return tz.gettz(OUTPUT_TIMEZONE)
-
 
 def fmt_in_tz(ts: dt.datetime, tz_obj) -> str:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
     return ts.astimezone(tz_obj).strftime("%d %b %Y %H:%M")
 
-
 def fmt_in_tz_compact(ts: dt.datetime, tz_obj) -> str:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
     return ts.astimezone(tz_obj).strftime("%Y-%m-%d %H:%M")
 
-
 def preview(txt: str, n: int = 120) -> str:
     t = (txt or "").strip().replace("\n", " ")
     return (t[:n] + "...") if len(t) > n else t
 
-
 def body_hash(body: str) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
-
 
 def _add(lines: List[str], s: Optional[str] = None):
     """Append a line, avoiding accidental double blank lines."""
@@ -127,29 +124,58 @@ def _add(lines: List[str], s: Optional[str] = None):
     else:
         lines.append(s)
 
-# ---- Severity & Product ----
-
 def _norm(s: Optional[str]) -> str:
     return (s or "").strip().lower()
 
+def _norm_product_name(p: Optional[str]) -> str:
+    return (p or "Unknown").strip()
+
+def is_govmeetings_product(product: str) -> Tuple[bool, str]:
+    p = (product or "").strip()
+    pl = p.lower()
+    for gm in GOVMEETINGS_PRODUCTS:
+        if pl == gm or gm in pl:
+            return True, ("UFC" if gm == "ufc" else gm.capitalize())
+    return False, p or "Unknown"
+
+# ---- Channel & product extraction ----
+
+def extract_channel(rec: Dict[str, Any]) -> str:
+    """
+    Be liberal in where we read the channel from. Common placements:
+    - rec['channel']
+    - rec['teams_channel']
+    - rec['room']
+    - rec['raw_event']['channel']
+    - rec['raw_event']['channelId'] (id string; still used for severity mapping if you put ids in env)
+    """
+    # flat
+    ch = rec.get("channel") or rec.get("teams_channel") or rec.get("room")
+    if ch:
+        return str(ch)
+    # nested raw_event
+    raw = rec.get("raw_event") or {}
+    ch = raw.get("channel") or raw.get("channelId") or raw.get("channelName")
+    return str(ch or "")
 
 def derive_severity(rec: Dict) -> str:
-    ch_name = (rec.get("channel") or "").strip().lower()
-
-    # 1) Explicit channel → severity mapping from env vars
+    """
+    Severity must be driven from channel names first (env vars),
+    then fallback to normalized_severity, then hints.
+    """
+    ch_name = extract_channel(rec).strip().lower()
     if ch_name in CRITICAL_CHANNELS:
         return "Critical"
     if ch_name in WARNING_CHANNELS:
         return "Warning"
 
-    # 2) Fallback to normalized_severity from upstream
-    explicit = (rec.get("normalized_severity") or "").strip().lower()
+    explicit = _norm(rec.get("normalized_severity"))
     if explicit in {"critical", "warning", "info"}:
         return explicit.capitalize()
 
-    # 3) Fallback to hints (critical/warning substrings in channel names)
     channelish = " ".join(filter(None, [
-        rec.get("channel"), rec.get("teams_channel"), rec.get("fromDisplay"),
+        extract_channel(rec),
+        rec.get("teams_channel"), rec.get("fromDisplay"),
         rec.get("source"), rec.get("source_system"), rec.get("team"), rec.get("room")
     ])).lower()
 
@@ -157,25 +183,56 @@ def derive_severity(rec: Dict) -> str:
         return "Critical"
     if any(h in channelish for h in WARNING_CHANNEL_HINTS):
         return "Warning"
-
     return "Unknown"
-
 
 def infer_product(rec: Dict) -> str:
     p = rec.get("product") or rec.get("service")
     if p:
         return str(p)
-    ch = (rec.get("channel") or "").lower()
+    ch = (extract_channel(rec) or "").lower()
     for key, val in PRODUCT_ALIASES.items():
         if key.lower() in ch:
             return val
     fr = rec.get("fromDisplay") or rec.get("source") or rec.get("source_system")
     return fr or "Unknown"
 
+def is_trivial_text(txt: str) -> bool:
+    t = (txt or "").strip()
+    return t == "" or t in {"<p>\\</p>", "<p></p>", "\\", "-", "."}
+
+def attachments_list(rec: Dict) -> List[Dict]:
+    return (rec.get("attachments")
+            or (rec.get("raw_event") or {}).get("attachments")
+            or [])
+
+def attachments_all_unknown(atts: List[Dict]) -> bool:
+    if not atts:
+        return True
+    for a in atts:
+        ct = (a.get("contentType") or "").strip().lower()
+        name = (a.get("name") or "").strip()
+        if ct and ct not in {"unknown", "application/octet-stream"}:
+            return False
+        if name:
+            return False
+    return True
+
+def should_skip_unknown(rec: Dict, body: str, sev: str) -> bool:
+    """
+    Skip alerts that are Unknown severity AND have trivial/empty text
+    AND have no meaningful attachments.
+    """
+    text = (rec.get("raw_event") or {}).get("text") or body
+    atts = attachments_list(rec)
+    return (
+        (sev == "Unknown")
+        and is_trivial_text(text)
+        and attachments_all_unknown(atts)
+    )
+
 # ---- State (S3) ----
 
 def load_digest_state() -> Optional[Dict]:
-    """Load the last digest state (window cursor) from S3. Returns a dict or None."""
     try:
         obj = s3.get_object(Bucket=DIGEST_STATE_BUCKET, Key=DIGEST_STATE_KEY)
         raw = obj["Body"].read()
@@ -190,9 +247,7 @@ def load_digest_state() -> Optional[Dict]:
         logger.warning(f"State load failed: {e}")
         return None
 
-
 def save_digest_state(state: Dict):
-    """Persist the last digest state (window cursor) to S3."""
     try:
         s3.put_object(
             Bucket=DIGEST_STATE_BUCKET,
@@ -221,7 +276,6 @@ def get_window_bounds(prev_end_utc: Optional[dt.datetime] = None, interval_minut
         start_utc = end_utc - dt.timedelta(minutes=interval_minutes)
 
     tz_obj = get_output_tz()
-    # Use compact numeric label for readability and consistency
     label = f"{fmt_in_tz_compact(start_utc, tz_obj)} - {fmt_in_tz_compact(end_utc, tz_obj)} {OUTPUT_TIMEZONE}"
     return start_utc, end_utc, label
 
@@ -240,7 +294,6 @@ def iter_day_objects(bucket: str, day: dt.date):
         if not resp.get("IsTruncated"):
             break
         token = resp.get("NextContinuationToken")
-
 
 def read_jsonl_object(bucket: str, key: str):
     try:
@@ -280,7 +333,6 @@ MEETING_NODE_PATTERNS = [
     r"\bgovmeetings[-_\w]*node[-_ ]?\d+\b"
 ]
 REBOOT_HINTS = [r"reboot(?:ed|ing)?", r"restart(?:ed|ing)?", r"cycled"]
-
 
 def _extract_entities_from_body(body: str) -> Dict[str, List[str]]:
     txt = body or ""
@@ -335,10 +387,13 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                 logger.info(f"Reading {key} ({size} bytes)")
             for rec in read_jsonl_object(ALERTS_BUCKET, key):
                 stats["lines_scanned"] += 1
-                body = rec.get("body", "")
+
+                # Extract a body-ish text
+                body = rec.get("body", "") or (rec.get("raw_event") or {}).get("text", "") or ""
                 if not body or not body.strip():
                     stats["lines_skipped_blank"] += 1
                     continue
+
                 ts_raw = rec.get("event_ts_utc") or rec.get("ingestion_ts_utc")
                 try:
                     ts = dt.datetime.fromisoformat((ts_raw or '').replace("Z", "+00:00")) if ts_raw else None
@@ -361,12 +416,21 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                             "window_end_utc": iso_z(end_utc)
                         })
                     continue
+
+                # Severity MUST be based on channel (from multiple locations)
                 norm_sev = derive_severity(rec)
+
+                # Ignore "unknown alert with unknown attachment"
+                if should_skip_unknown(rec, body, norm_sev):
+                    continue
+
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
                     "body": body,
-                    "fromDisplay": rec.get("fromDisplay") or rec.get("source") or rec.get("source_system") or "",
-                    "channel": rec.get("channel"),
+                    "fromDisplay": rec.get("fromDisplay")
+                                    or (rec.get("raw_event") or {}).get("fromDisplay")
+                                    or rec.get("source") or rec.get("source_system") or "",
+                    "channel": extract_channel(rec),
                     "event_ts_utc": ts_raw,
                     "norm_severity": norm_sev,
                     "product": infer_product(rec)
@@ -383,7 +447,6 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
     _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
     collect_alerts_s3._last_stats = stats
     return alerts
-
 
 def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
     doc = {
@@ -438,11 +501,9 @@ JSON_INSTRUCTION = (
     "}\n"
 )
 
-
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
-
 
 def _build_bedrock_body(system: str, user_message: str) -> bytes:
     body = json.dumps({
@@ -455,7 +516,6 @@ def _build_bedrock_body(system: str, user_message: str) -> bytes:
         "top_k": 250
     })
     return body.encode('utf-8')
-
 
 def invoke_bedrock_json(session_id: str,
                         window_label: str,
@@ -547,7 +607,6 @@ def invoke_bedrock_json(session_id: str,
 
 SEV_RANK = {"critical": 0, "warning": 1, "info": 2, "unknown": 3}
 
-
 def _sev_emoji(sev: str) -> str:
     s = (sev or "").lower()
     if s == "critical":
@@ -557,7 +616,6 @@ def _sev_emoji(sev: str) -> str:
     if s == "info":
         return "🔵"
     return "⚪"
-
 
 def _merge_lists(a: Optional[List[str]], b: Optional[List[str]], cap: int) -> List[str]:
     out, seen = [], set()
@@ -572,7 +630,6 @@ def _merge_lists(a: Optional[List[str]], b: Optional[List[str]], cap: int) -> Li
             if len(out) >= cap:
                 return out
     return out
-
 
 def merge_chunk_results(chunks: List[Dict]) -> Dict:
     agg = {
@@ -606,56 +663,43 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
             else:
                 item["occurrences"] += int(g.get("occurrences", 1) or 1)
                 # earliest first_seen, latest last_seen
-                try:
-                    fs_existing = dt.datetime.fromisoformat((item["first_seen_utc"] or '').replace("Z", "+00:00")) if item.get("first_seen_utc") else None
-                    if fs_existing and fs_existing.tzinfo is None:
-                        fs_existing = fs_existing.replace(tzinfo=UTC)
-                except Exception:
-                    fs_existing = None
-                try:
-                    fs_new = dt.datetime.fromisoformat((g.get("first_seen_utc") or '').replace("Z", "+00:00")) if g.get("first_seen_utc") else None
-                    if fs_new and fs_new.tzinfo is None:
-                        fs_new = fs_new.replace(tzinfo=UTC)
-                except Exception:
-                    fs_new = None
+                def _p(s): 
+                    if not s: return None
+                    try:
+                        d = dt.datetime.fromisoformat(s.replace("Z","+00:00"))
+                        if d.tzinfo is None: d = d.replace(tzinfo=UTC)
+                        return d.astimezone(UTC)
+                    except Exception:
+                        return None
+                fs_existing = _p(item.get("first_seen_utc"))
+                fs_new = _p(g.get("first_seen_utc"))
                 if fs_existing is None or (fs_new and fs_new < fs_existing):
                     item["first_seen_utc"] = g.get("first_seen_utc")
-                try:
-                    ls_existing = dt.datetime.fromisoformat((item["last_seen_utc"] or '').replace("Z", "+00:00")) if item.get("last_seen_utc") else None
-                    if ls_existing and ls_existing.tzinfo is None:
-                        ls_existing = ls_existing.replace(tzinfo=UTC)
-                except Exception:
-                    ls_existing = None
-                try:
-                    ls_new = dt.datetime.fromisoformat((g.get("last_seen_utc") or '').replace("Z", "+00:00")) if g.get("last_seen_utc") else None
-                    if ls_new and ls_new.tzinfo is None:
-                        ls_new = ls_new.replace(tzinfo=UTC)
-                except Exception:
-                    ls_new = None
+                ls_existing = _p(item.get("last_seen_utc"))
+                ls_new = _p(g.get("last_seen_utc"))
                 if ls_existing is None or (ls_new and ls_new > ls_existing):
                     item["last_seen_utc"] = g.get("last_seen_utc")
-                # prefer longer summary
                 if len(g.get("summary", "")) > len(item.get("summary", "")):
                     item["summary"] = g.get("summary")
-                # merge actions and appendix (dedupe, cap)
                 item["suggested_actions"] = _merge_lists(item.get("suggested_actions"), g.get("suggested_actions"), 8)
                 item["appendix_previews"] = _merge_lists(item.get("appendix_previews"), g.get("appendix_previews"), 20)
-                # merge entities
                 ent = item.setdefault("entities", {})
                 g_ent = g.get("entities") or {}
                 for k_merge, capn in [("affected_hosts", 20), ("swagit_mag_ids", 20), ("rebooted_nodes", 20)]:
                     ent[k_merge] = _merge_lists(ent.get(k_merge), g_ent.get(k_merge), capn)
     return agg
 
-
 def _rank_for_product(groups: List[Dict]) -> int:
-    # worst severity rank within product
     worst = 9
     for g in groups:
         s = (g.get('severity') or '').lower()
         worst = min(worst, SEV_RANK.get(s, 9))
     return worst
 
+def _govmeetings_first_key(item):
+    prod, groups = item
+    is_gm, _canon = is_govmeetings_product(prod)
+    return (0 if is_gm else 1, _rank_for_product(groups), prod.lower())
 
 def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) -> str:
     tz_obj = get_output_tz()
@@ -663,7 +707,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
     next_local = fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), tz_obj)
 
     lines: List[str] = []
-    _add(lines, "🛡️ #SRE Digest")
+    _add(lines, "## 🛡️ SRE Digest")
     _add(lines)
     _add(lines, f"**Timestamp ({OUTPUT_TIMEZONE}):** {now_local}")
     _add(lines, f"**Window:** {window_label}")
@@ -672,7 +716,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
 
     k = agg.get("kpis", {})
     _add(lines, "## Summary KPIs")
-    _add(lines, f"- **🧮 Total alerts:** {k.get('total_alerts', 0)} (raw count)")
+    _add(lines, f"- **🧮 Total alerts:** {k.get('total_alerts', 0)}")
     _add(lines, f"- **🔴 Critical:** {k.get('critical', 0)}")
     _add(lines, f"- **🟠 Warning:** {k.get('warning', 0)}")
     _add(lines, f"- **🔵 Info:** {k.get('info', 0)}")
@@ -684,12 +728,28 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
     for (_, _, _), g in agg.get("groups", {}).items():
         by_product.setdefault(g["product"], []).append(g)
 
-    # sort products by worst severity (Critical first), then name
-    products_sorted = sorted(by_product.items(), key=lambda kv: (_rank_for_product(kv[1]), kv[0].lower()))
+    # quick listing of GovMeetings vs Other
+    gm_set = set()
+    other_set = set()
+    for prod in by_product.keys():
+        is_gm, canon = is_govmeetings_product(prod)
+        if is_gm:
+            gm_set.add(canon)
+        else:
+            if _norm_product_name(prod) != "Unknown":
+                other_set.add(prod)
+
+    _add(lines, "### GovMeetings products in this window")
+    _add(lines, "- " + (", ".join(sorted(gm_set)) if gm_set else "_None detected_"))
+    _add(lines, "### Other products")
+    _add(lines, "- " + (", ".join(sorted(other_set)) if other_set else "_None_"))
+    _add(lines)
+
+    # sort products by GovMeetings-first, then worst severity, then name
+    products_sorted = sorted(by_product.items(), key=_govmeetings_first_key)
 
     for product, items in products_sorted:
         _add(lines, f"### 📦 Product — {product}")
-        # sort Critical -> Warning -> Info -> Unknown, then occurrences desc, then title
         items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), -int(x.get('occurrences', 1)), x.get('title','')))
         for g in items:
             emoji = _sev_emoji(g.get("severity"))
@@ -704,6 +764,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             mags = ent.get("swagit_mag_ids") or []
             hosts = ent.get("affected_hosts") or []
 
+            # NO giant H1/H2 per alert; just bold line
             _add(lines, f"**{emoji} {title}**")
             _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
             _add(lines, f"- **Component:** _{component}_")
@@ -729,7 +790,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
     # Appendix (flat list from all groups)
     all_previews = []
     for (_, _, _), g in agg.get("groups", {}).items():
-        for p in (g.get("appendix_previews") or [])[:3]:  # keep it short per group
+        for p in (g.get("appendix_previews") or [])[:3]:
             all_previews.append(p)
 
     if all_previews:
@@ -745,21 +806,20 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
         md = md[:TEAMS_MAX_CHARS - 2000] + "\n\n_(truncated to fit Teams limit)_"
     return md
 
-
 def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) -> str:
     tz_obj = get_output_tz()
     now_local = fmt_in_tz_compact(now_utc(), tz_obj)
     next_local = fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), tz_obj)
 
     lines: List[str] = []
-    _add(lines, "# 🛡️ SRE Digest (Lite)")
+    _add(lines, "## 🛡️ SRE Digest (Lite)")
     _add(lines, f"Window: {window_label}")
     _add(lines, f"Last update: {now_local} • Next: {next_local}")
     _add(lines)
 
     k = agg.get("kpis", {})
     _add(lines, "**Summary**")
-    _add(lines, f"- **🧮 Total alerts:** {k.get('total_alerts', 0)} (raw count)")
+    _add(lines, f"- 🧮 Total alerts: {k.get('total_alerts', 0)}")
     _add(lines, f"- 🔴 Critical: {k.get('critical', 0)}")
     _add(lines, f"- 🟠 Warning: {k.get('warning', 0)}")
     _add(lines, f"- 🔵 Info: {k.get('info', 0)}")
@@ -770,7 +830,23 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
     for (_, _, _), g in agg.get("groups", {}).items():
         by_product.setdefault(g["product"], []).append(g)
 
-    products_sorted = sorted(by_product.items(), key=lambda kv: (_rank_for_product(kv[1]), kv[0].lower()))
+    gm_set = set()
+    other_set = set()
+    for prod in by_product.keys():
+        is_gm, canon = is_govmeetings_product(prod)
+        if is_gm:
+            gm_set.add(canon)
+        else:
+            if _norm_product_name(prod) != "Unknown":
+                other_set.add(prod)
+
+    _add(lines, "### GovMeetings products in this window")
+    _add(lines, "- " + (", ".join(sorted(gm_set)) if gm_set else "_None detected_"))
+    _add(lines, "### Other products")
+    _add(lines, "- " + (", ".join(sorted(other_set)) if other_set else "_None_"))
+    _add(lines)
+
+    products_sorted = sorted(by_product.items(), key=_govmeetings_first_key)
     for product, items in products_sorted:
         _add(lines, f"### 📦 {product}")
         items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), -int(x.get('occurrences', 1))))
@@ -809,10 +885,8 @@ def lambda_handler(event, context):
     logger.info(f"Digest start event={json.dumps(event or {}, cls=DateTimeEncoder)}")
 
     event = event or {}
-    # Per-invocation interval override
     interval_minutes = int(event.get("minutes", DIGEST_INTERVAL_MINUTES_DEFAULT))
 
-    # Load previous state
     state = load_digest_state()
     prev_end_utc = None
     prev_end_iso = None
@@ -826,7 +900,6 @@ def lambda_handler(event, context):
         except Exception as e:
             logger.warning(f"Invalid state.last_end_utc: {state.get('last_end_utc')} ({e})")
 
-    # Compute window (allow override via event.window.start_utc/end_utc ISO8601)
     win_override = event.get("window") or {}
     if win_override.get("start_utc") and win_override.get("end_utc"):
         try:
@@ -843,7 +916,6 @@ def lambda_handler(event, context):
     tz_obj = get_output_tz()
     next_local_time = fmt_in_tz_compact(end_utc + dt.timedelta(minutes=interval_minutes), tz_obj)
 
-    # Warn if legacy module file still present
     try:
         import os as _os
         if _os.path.exists(_os.path.join(_os.path.dirname(__file__), 's3-digest.py')):
@@ -856,7 +928,7 @@ def lambda_handler(event, context):
     log_alert_details(alerts)
 
     if not alerts:
-        md = "# 🛡️ SRE Digest\n\n_No alerts/messages found in this window._\n\n" + \
+        md = "## 🛡️ SRE Digest\n\n_No alerts/messages found in this window._\n\n" + \
              f"🕒 Last update: {fmt_in_tz_compact(now_utc(), tz_obj)} – next update at {next_local_time}"
         posted = post_markdown_to_teams(md)
         save_digest_state({
@@ -872,7 +944,7 @@ def lambda_handler(event, context):
     session_id = "s3-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
     chunks = list(chunk_list(alerts, MAX_BODIES_PER_CALL))
 
-    # ---- PARALLEL Bedrock calls ----
+    # PARALLEL Bedrock calls
     results: List[Dict] = [None] * len(chunks)
     max_workers = min(BEDROCK_CONCURRENCY, len(chunks)) or 1
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -899,14 +971,13 @@ def lambda_handler(event, context):
 
     agg = merge_chunk_results([r or {"kpis": {}, "groups": []} for r in results])
 
-    if LITE_DIGEST:
-        final_md = render_markdown_lite(agg, window_label, interval_minutes)
-    else:
-        final_md = render_markdown_full(agg, window_label, interval_minutes)
+    # Add reliable Total alerts KPI AFTER filtering
+    agg.setdefault("kpis", {})
+    agg["kpis"]["total_alerts"] = len(alerts)
 
+    final_md = render_markdown_lite(agg, window_label, interval_minutes) if LITE_DIGEST else render_markdown_full(agg, window_label, interval_minutes)
     posted = post_markdown_to_teams(final_md)
 
-    # Persist new state
     save_digest_state({
         "last_start_utc": iso_z(start_utc),
         "last_end_utc": iso_z(end_utc),
@@ -929,7 +1000,6 @@ def lambda_handler(event, context):
     if DEBUG_MODE and final_md:
         out["markdown_chars"] = len(final_md)
     return out
-
 
 if __name__ == "__main__":
     print(json.dumps(lambda_handler({}, None), indent=2))
