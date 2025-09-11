@@ -10,7 +10,7 @@ import hashlib
 from dateutil import tz
 from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import re
+import time
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -25,11 +25,12 @@ DIGEST_INTERVAL_MINUTES_DEFAULT = int(os.environ.get("DIGEST_INTERVAL_MINUTES", 
 OUTPUT_TIMEZONE = os.environ.get("OUTPUT_TIMEZONE", "UTC")
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
 MAX_BODIES_PER_CALL = int(os.environ.get("MAX_BODIES_PER_CALL", "90"))
-# Render style: set to false for full, true for ultra-compact
 LITE_DIGEST = os.environ.get("LITE_DIGEST", "false").lower() == "true"
 
-# Concurrency
-BEDROCK_CONCURRENCY = int(os.environ.get("BEDROCK_CONCURRENCY", "4"))
+# Concurrency & retries
+BEDROCK_CONCURRENCY = int(os.environ.get("BEDROCK_CONCURRENCY", "6"))
+BEDROCK_MAX_RETRIES = int(os.environ.get("BEDROCK_MAX_RETRIES", "4"))
+BEDROCK_RETRY_BASE_DELAY = float(os.environ.get("BEDROCK_RETRY_BASE_DELAY", "0.75"))
 
 # Logging & debug
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
@@ -43,22 +44,22 @@ BEDROCK_FULL_MAX_CHARS = int(os.environ.get("BEDROCK_FULL_MAX_CHARS", "4000"))
 LOG_SKIPPED_TIME = os.environ.get("LOG_SKIPPED_TIME", "false").lower() == "true"
 SKIPPED_TIME_LIMIT = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
 
-# State persistence (optional overrides)
+# State persistence
 DIGEST_STATE_BUCKET = os.environ.get("DIGEST_STATE_BUCKET") or ALERTS_BUCKET
 DIGEST_STATE_KEY = os.environ.get("DIGEST_STATE_KEY", "state/sre-digest-state.json")
 USE_PREV_WINDOW = os.environ.get("USE_PREV_WINDOW", "true").lower() == "true"
 MAX_CATCHUP_MINUTES = int(os.environ.get("MAX_CATCHUP_MINUTES", "180"))
 
 # Teams output mode
-TEAMS_MAX_CHARS = int(os.environ.get("TEAMS_MAX_CHARS", "24000"))  # safety cap
+TEAMS_MAX_CHARS = int(os.environ.get("TEAMS_MAX_CHARS", "24000"))
 
-# Channel-driven severity via ENV (names are compared case-insensitively)
+# Channel-driven severity via ENV
 CRITICAL_CHANNELS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNELS", "").split(",") if t.strip()]
 WARNING_CHANNELS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNELS", "").split(",") if t.strip()]
 CRITICAL_CHANNEL_HINTS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNEL_HINTS", "critical,crit,sev1,p1,urgent").split(",") if t.strip()]
 WARNING_CHANNEL_HINTS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNEL_HINTS", "warning,warn,sev2,p2,alert").split(",") if t.strip()]
 
-# Optional product inference hints: JSON like {"registrar": "Registrar", "govmeetings": "GovMeetings"}
+# Optional product mapping hints (e.g., {"govmeetings":"GovMeetings"})
 PRODUCT_ALIAS_JSON = os.environ.get("PRODUCT_ALIAS_JSON", "{}")
 try:
     PRODUCT_ALIASES: Dict[str, str] = json.loads(PRODUCT_ALIAS_JSON)
@@ -66,9 +67,7 @@ except Exception:
     PRODUCT_ALIASES = {}
 
 # GovMeetings product family (for listing)
-GOVMEETINGS_PRODUCTS = {
-    "onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit"
-}
+GOVMEETINGS_PRODUCTS = {"onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit"}
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -77,14 +76,12 @@ log_s3 = boto3.client("s3") if SAVE_BEDROCK_LOGS and BEDROCK_LOGS_S3_BUCKET else
 
 UTC = dt.timezone.utc
 
-# ---- Custom JSON Encoder ----
+# ---- Encoders & small helpers ----
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, (dt.datetime, dt.date)):
             return o.isoformat()
         return super().default(o)
-
-# ---- Helpers ----
 
 def now_utc():
     return dt.datetime.utcnow().replace(tzinfo=UTC, microsecond=0)
@@ -99,11 +96,6 @@ def iso_z(ts: Optional[dt.datetime]) -> Optional[str]:
 def get_output_tz():
     return tz.gettz(OUTPUT_TIMEZONE)
 
-def fmt_in_tz(ts: dt.datetime, tz_obj) -> str:
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    return ts.astimezone(tz_obj).strftime("%d %b %Y %H:%M")
-
 def fmt_in_tz_compact(ts: dt.datetime, tz_obj) -> str:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
@@ -117,7 +109,6 @@ def body_hash(body: str) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
 
 def _add(lines: List[str], s: Optional[str] = None):
-    """Append a line, avoiding accidental double blank lines."""
     if s is None or s == "":
         if not lines or lines[-1] != "":
             lines.append("")
@@ -139,30 +130,15 @@ def is_govmeetings_product(product: str) -> Tuple[bool, str]:
     return False, p or "Unknown"
 
 # ---- Channel & product extraction ----
-
 def extract_channel(rec: Dict[str, Any]) -> str:
-    """
-    Be liberal in where we read the channel from. Common placements:
-    - rec['channel']
-    - rec['teams_channel']
-    - rec['room']
-    - rec['raw_event']['channel']
-    - rec['raw_event']['channelId'] (id string; still used for severity mapping if you put ids in env)
-    """
-    # flat
     ch = rec.get("channel") or rec.get("teams_channel") or rec.get("room")
     if ch:
         return str(ch)
-    # nested raw_event
     raw = rec.get("raw_event") or {}
-    ch = raw.get("channel") or raw.get("channelId") or raw.get("channelName")
+    ch = raw.get("channel") or raw.get("channelName") or raw.get("channelId")
     return str(ch or "")
 
 def derive_severity(rec: Dict) -> str:
-    """
-    Severity must be driven from channel names first (env vars),
-    then fallback to normalized_severity, then hints.
-    """
     ch_name = extract_channel(rec).strip().lower()
     if ch_name in CRITICAL_CHANNELS:
         return "Critical"
@@ -193,7 +169,8 @@ def infer_product(rec: Dict) -> str:
     for key, val in PRODUCT_ALIASES.items():
         if key.lower() in ch:
             return val
-    fr = rec.get("fromDisplay") or rec.get("source") or rec.get("source_system")
+    fr = rec.get("fromDisplay") or (rec.get("raw_event") or {}).get("fromDisplay") \
+         or rec.get("source") or rec.get("source_system")
     return fr or "Unknown"
 
 def is_trivial_text(txt: str) -> bool:
@@ -218,28 +195,18 @@ def attachments_all_unknown(atts: List[Dict]) -> bool:
     return True
 
 def should_skip_unknown(rec: Dict, body: str, sev: str) -> bool:
-    """
-    Skip alerts that are Unknown severity AND have trivial/empty text
-    AND have no meaningful attachments.
-    """
     text = (rec.get("raw_event") or {}).get("text") or body
     atts = attachments_list(rec)
-    return (
-        (sev == "Unknown")
-        and is_trivial_text(text)
-        and attachments_all_unknown(atts)
-    )
+    return (sev == "Unknown") and is_trivial_text(text) and attachments_all_unknown(atts)
 
 # ---- State (S3) ----
-
 def load_digest_state() -> Optional[Dict]:
     try:
         obj = s3.get_object(Bucket=DIGEST_STATE_BUCKET, Key=DIGEST_STATE_KEY)
         raw = obj["Body"].read()
         return json.loads(raw)
     except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code == "NoSuchKey":
+        if e.response.get("Error", {}).get("Code") == "NoSuchKey":
             return None
         logger.warning(f"State load failed: {e}")
         return None
@@ -259,7 +226,6 @@ def save_digest_state(state: Dict):
         logger.error(f"State save failed: {e}")
 
 # ---- Window Calculation ----
-
 def get_window_bounds(prev_end_utc: Optional[dt.datetime] = None, interval_minutes: int = None) -> Tuple[dt.datetime, dt.datetime, str]:
     if interval_minutes is None:
         interval_minutes = DIGEST_INTERVAL_MINUTES_DEFAULT
@@ -268,19 +234,15 @@ def get_window_bounds(prev_end_utc: Optional[dt.datetime] = None, interval_minut
         start_utc = prev_end_utc + dt.timedelta(microseconds=1)
         max_lookback = end_utc - dt.timedelta(minutes=MAX_CATCHUP_MINUTES)
         if start_utc < max_lookback:
-            logger.warning(
-                f"Start capped by MAX_CATCHUP_MINUTES from {iso_z(start_utc)} to {iso_z(max_lookback)}"
-            )
+            logger.warning(f"Start capped by MAX_CATCHUP_MINUTES from {iso_z(start_utc)} to {iso_z(max_lookback)}")
             start_utc = max_lookback
     else:
         start_utc = end_utc - dt.timedelta(minutes=interval_minutes)
-
     tz_obj = get_output_tz()
     label = f"{fmt_in_tz_compact(start_utc, tz_obj)} - {fmt_in_tz_compact(end_utc, tz_obj)} {OUTPUT_TIMEZONE}"
     return start_utc, end_utc, label
 
 # ---- S3 Reading ----
-
 def iter_day_objects(bucket: str, day: dt.date):
     prefix = f"alerts/year={day.year:04d}/month={day.month:02d}/day={day.day:02d}/"
     token = None
@@ -313,191 +275,24 @@ def read_jsonl_object(bucket: str, key: str):
     except Exception as e:
         logger.error(f"Failed reading {key}: {e}")
 
-# ---- Entity Extraction from Bodies ----
-
-HOST_PATTERNS = [
-    r"\bip-\d{1,3}(?:-\d{1,3}){3}\b",
-    r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
-    r"\bnode[-\w\.]+\b",
-    r"\bhost[-\w\.]+\b",
-    r"\bk8s[-\w\.]+\b",
-    r"\bi-[0-9a-f]{17}\b"
-]
-MAG_PATTERNS = [
-    r"\bswagit[-_ ]?mag[-_ ]?\d+\b",
-    r"\bmag[-_ ]?\d+\b",
-    r"\bMAG[-_ ]?\d+\b"
-]
-MEETING_NODE_PATTERNS = [
-    r"\bmeeting[-_ ]?node[-_ ]?\d+\b",
-    r"\bgovmeetings[-_\w]*node[-_ ]?\d+\b"
-]
-REBOOT_HINTS = [r"reboot(?:ed|ing)?", r"restart(?:ed|ing)?", r"cycled"]
-
-def _extract_entities_from_body(body: str) -> Dict[str, List[str]]:
-    txt = body or ""
-    out = {"affected_hosts": [], "swagit_mag_ids": [], "rebooted_nodes": []}
-    # generic hosts
-    seen = set()
-    for pat in HOST_PATTERNS:
-        for m in re.findall(pat, txt, flags=re.IGNORECASE):
-            k = m.strip()
-            if k and k.lower() not in seen:
-                seen.add(k.lower()); out["affected_hosts"].append(k)
-    # swagit mags
-    seen_mag = set()
-    for pat in MAG_PATTERNS:
-        for m in re.findall(pat, txt, flags=re.IGNORECASE):
-            k = m.strip()
-            if k and k.lower() not in seen_mag:
-                seen_mag.add(k.lower()); out["swagit_mag_ids"].append(k)
-    # meeting nodes + reboot context
-    nodes = set()
-    for pat in MEETING_NODE_PATTERNS:
-        for m in re.findall(pat, txt, flags=re.IGNORECASE):
-            nodes.add(m.strip())
-    reboot_flag = any(re.search(h, txt, flags=re.IGNORECASE) for h in REBOOT_HINTS)
-    if reboot_flag and nodes:
-        out["rebooted_nodes"] = sorted(nodes)
-    return out
-
-# ---- Collect Alerts ----
-
-def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) -> List[Dict]:
-    alerts: List[Dict] = []
-    stats = {
-        "objects_listed": 0,
-        "objects_read": 0,
-        "lines_scanned": 0,
-        "lines_valid": 0,
-        "lines_skipped_blank": 0,
-        "lines_skipped_time": 0,
-        "lines_parse_errors": 0,
-        "cap_hit": False,
-    }
-    skipped_time_samples = []
-    day = start_utc.date()
-    while day <= end_utc.date():
-        for key, size in iter_day_objects(ALERTS_BUCKET, day):
-            stats["objects_listed"] += 1
-            if not (key.endswith('.jsonl') or key.endswith('.jsonl.gz')):
-                continue
-            stats["objects_read"] += 1
-            if DEBUG_MODE:
-                logger.info(f"Reading {key} ({size} bytes)")
-            for rec in read_jsonl_object(ALERTS_BUCKET, key):
-                stats["lines_scanned"] += 1
-
-                # Extract a body-ish text
-                body = rec.get("body", "") or (rec.get("raw_event") or {}).get("text", "") or ""
-                if not body or not body.strip():
-                    stats["lines_skipped_blank"] += 1
-                    continue
-
-                ts_raw = rec.get("event_ts_utc") or rec.get("ingestion_ts_utc")
-                try:
-                    ts = dt.datetime.fromisoformat((ts_raw or '').replace("Z", "+00:00")) if ts_raw else None
-                    if ts and ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=UTC)
-                    if ts:
-                        ts = ts.astimezone(UTC)
-                except Exception:
-                    ts = None
-                    stats["lines_parse_errors"] += 1
-                if ts is None or ts < start_utc or ts > end_utc:
-                    stats["lines_skipped_time"] += 1
-                    if LOG_SKIPPED_TIME and len(skipped_time_samples) < SKIPPED_TIME_LIMIT:
-                        skipped_time_samples.append({
-                            "messageId": rec.get("messageId"),
-                            "event_ts_utc": ts_raw,
-                            "parsed": iso_z(ts) if ts else None,
-                            "reason": "null_or_outside_window",
-                            "window_start_utc": iso_z(start_utc),
-                            "window_end_utc": iso_z(end_utc)
-                        })
-                    continue
-
-                # Severity MUST be based on channel (from multiple locations)
-                norm_sev = derive_severity(rec)
-
-                # Ignore "unknown alert with unknown attachment"
-                if should_skip_unknown(rec, body, norm_sev):
-                    continue
-
-                alerts.append({
-                    "messageId": rec.get("messageId", "unknown"),
-                    "body": body,
-                    "fromDisplay": rec.get("fromDisplay")
-                                    or (rec.get("raw_event") or {}).get("fromDisplay")
-                                    or rec.get("source") or rec.get("source_system") or "",
-                    "channel": extract_channel(rec),
-                    "event_ts_utc": ts_raw,
-                    "norm_severity": norm_sev,
-                    "product": infer_product(rec)
-                })
-                stats["lines_valid"] += 1
-                if len(alerts) >= cap:
-                    stats["cap_hit"] = True
-                    if DEBUG_MODE:
-                        logger.info(f"Hit cap {cap}, stopping collection")
-                    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
-                    collect_alerts_s3._last_stats = stats
-                    return alerts
-        day += dt.timedelta(days=1)
-    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
-    collect_alerts_s3._last_stats = stats
-    return alerts
-
-def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
-    doc = {
-        "tag": "DIGEST_COLLECTION_STATS",
-        "window_start_utc": iso_z(start_utc),
-        "window_end_utc": iso_z(end_utc),
-        **stats
-    }
-    if skipped_time_samples:
-        doc["skipped_time_samples"] = skipped_time_samples
-    logger.info(json.dumps(doc, cls=DateTimeEncoder))
-
-# ---- Debug Logging of Collected Alerts ----
-
-def log_alert_details(alerts: List[Dict]):
-    if not (DEBUG_MODE and LOG_ALERT_DETAIL):
-        return
-    limit = min(ALERT_LOG_LIMIT, len(alerts))
-    logger.info(f"Logging first {limit} alerts (of {len(alerts)}) for digest debug")
-    for i, a in enumerate(alerts[:limit]):
-        body_preview = preview(a.get("body", ""), 140)
-        logger.info(
-            json.dumps({
-                "tag": "ALERT_FOR_DIGEST",
-                "idx": i,
-                "messageId": a.get("messageId"),
-                "event_ts_utc": a.get("event_ts_utc"),
-                "from": a.get("fromDisplay"),
-                "channel": a.get("channel"),
-                "norm_severity": a.get("norm_severity"),
-                "product": a.get("product"),
-                "body_preview": body_preview,
-                "body_hash": body_hash(a.get("body", ""))
-            }, cls=DateTimeEncoder)
-        )
-    if len(alerts) > limit:
-        logger.info(f"(Suppressed {len(alerts) - limit} additional alerts; increase ALERT_LOG_LIMIT to see more)")
-
-# ---- Bedrock Prompt (FULL JSON Schema) ----
-
+# ---- Bedrock Prompt ----
 JSON_INSTRUCTION = (
     "You are an SRE assistant summarizing alerts into structured JSON for a markdown digest.\n"
-    "Rules: Do NOT invent facts. Use normalized_severity as-is.\n"
-    "Group very similar items (same problem) into a single group.\n"
-    "For each group, infer a concise title, a single-sentence summary, and up to 5 suggested_actions (clear, imperative).\n"
-    "If product is blank or 'Unknown', infer from text if obvious, else leave as 'Unknown'.\n"
-    "If you can spot a specific component/service from text, populate 'component'. Otherwise omit or set to null.\n"
-    "Use the provided 'hints' per item (affected_hosts, swagit_mag_ids, rebooted_nodes) to populate 'entities' when corroborated by the text.\n"
+    "Rules:\n"
+    "- Do NOT invent facts.\n"
+    "- Use 'channel_severity' as the severity for all items.\n"
+    "- Extract hosts from free text (tokens that look like hostnames/IPs/FQDNs such as 'azmop-legweb2.obp.dc.gdi'),\n"
+    "  and put them in entities.affected_hosts (dedup, cap 20).\n"
+    "- Extract 'component' if any hint like 'component:', 'service:', 'group:' suggests one (short string).\n"
+    "- Group similar items (same problem) into a single group.\n"
+    "- For each group, produce a concise title, one-sentence summary, and up to 5 suggested_actions.\n"
+    "- If product is blank or 'Unknown', infer from text if obvious, else leave as 'Unknown'.\n"
     "Respond ONLY with JSON matching this schema: {\n"
     "  kpis: {critical:number, warning:number, info:number, unknown:number, noise:number},\n"
-    "  groups: [{product:string, title:string, summary:string, severity:string, component?:string|null, first_seen_utc:string, last_seen_utc:string, occurrences:number, suggested_actions?:string[], appendix_previews?:string[], entities?:{affected_hosts?:string[], swagit_mag_ids?:string[], rebooted_nodes?:string[]}}]\n"
+    "  groups: [{product:string, title:string, summary:string, severity:string, component?:string|null,\n"
+    "           first_seen_utc:string, last_seen_utc:string, occurrences:number,\n"
+    "           suggested_actions?:string[], appendix_previews?:string[],\n"
+    "           entities?:{affected_hosts?:string[], swagit_mag_ids?:string[], rebooted_nodes?:string[]}}]\n"
     "}\n"
 )
 
@@ -517,6 +312,23 @@ def _build_bedrock_body(system: str, user_message: str) -> bytes:
     })
     return body.encode('utf-8')
 
+def _bedrock_invoke_with_retry(body_bytes: bytes) -> Dict[str, Any]:
+    last_err = None
+    for attempt in range(1, BEDROCK_MAX_RETRIES + 1):
+        try:
+            resp = bedrock_rt.invoke_model(
+                modelId=MODEL_ID,
+                body=body_bytes,
+                contentType='application/json',
+                accept='application/json'
+            )
+            return json.loads(resp['body'].read())
+        except Exception as e:
+            last_err = e
+            delay = BEDROCK_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            time.sleep(delay + 0.1 * delay)
+    raise last_err if last_err else RuntimeError("Bedrock invoke failed")
+
 def invoke_bedrock_json(session_id: str,
                         window_label: str,
                         alerts: List[Dict],
@@ -526,17 +338,17 @@ def invoke_bedrock_json(session_id: str,
                         next_local_time: str,
                         interval_minutes: int) -> Dict:
     tz_obj = get_output_tz()
-    current_local = fmt_in_tz(now_utc(), tz_obj)
+    current_local = fmt_in_tz_compact(now_utc(), tz_obj)
     current_utc = now_utc().strftime("%Y-%m-%d %H:%M")
 
     payload_items = [{
         "messageId": a["messageId"],
         "from": a.get("fromDisplay", ""),
+        "channel": a.get("channel", ""),
         "body": a["body"],
         "event_ts_utc": a.get("event_ts_utc"),
-        "normalized_severity": a.get("norm_severity"),
+        "channel_severity": a.get("norm_severity"),
         "product": a.get("product", "Unknown"),
-        "hints": _extract_entities_from_body(a.get("body", ""))
     } for a in alerts]
 
     system = JSON_INSTRUCTION
@@ -559,24 +371,18 @@ def invoke_bedrock_json(session_id: str,
         try:
             req_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/request-chunk-{chunk_index:03d}.json"
             log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=body_bytes, ContentType='application/json')
-            req_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': req_key}, ExpiresIn=3600*24)
+            req_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': req_key}, ExpiresIn=86400)
         except Exception as e:
             logger.error(f"Failed saving bedrock request: {e}")
 
     try:
-        resp = bedrock_rt.invoke_model(
-            modelId=MODEL_ID,
-            body=body_bytes,
-            contentType='application/json',
-            accept='application/json'
-        )
-        response_body = json.loads(resp['body'].read())
+        response_body = _bedrock_invoke_with_retry(body_bytes)
         raw = response_body.get('content', [{}])[0].get('text', "").strip()
         if DEBUG_MODE and log_s3:
             try:
                 resp_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/response-chunk-{chunk_index:03d}.json"
                 log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=resp_key, Body=raw.encode('utf-8'), ContentType='application/json')
-                resp_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': resp_key}, ExpiresIn=3600*24)
+                resp_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': resp_key}, ExpiresIn=86400)
             except Exception as e:
                 logger.error(f"Failed saving bedrock response: {e}")
 
@@ -588,13 +394,10 @@ def invoke_bedrock_json(session_id: str,
 
         if DEBUG_MODE:
             stat = {"chunk_index": chunk_index, "chars": len(raw), "hash": body_hash(raw), "groups": len(parsed.get('groups', []))}
-            if not hasattr(invoke_bedrock_json, '_last_response_stats'):
-                invoke_bedrock_json._last_response_stats = []
+            invoke_bedrock_json._last_response_stats = getattr(invoke_bedrock_json, "_last_response_stats", [])
             invoke_bedrock_json._last_response_stats.append(stat)
-            if not hasattr(invoke_bedrock_json, '_last_req_urls'):
-                invoke_bedrock_json._last_req_urls = {}
-            if not hasattr(invoke_bedrock_json, '_last_resp_urls'):
-                invoke_bedrock_json._last_resp_urls = {}
+            invoke_bedrock_json._last_req_urls = getattr(invoke_bedrock_json, "_last_req_urls", {})
+            invoke_bedrock_json._last_resp_urls = getattr(invoke_bedrock_json, "_last_resp_urls", {})
             invoke_bedrock_json._last_req_urls[chunk_index] = req_url
             invoke_bedrock_json._last_resp_urls[chunk_index] = resp_url
 
@@ -604,7 +407,6 @@ def invoke_bedrock_json(session_id: str,
         return {"kpis": {}, "groups": []}
 
 # ---- Merge & Render ----
-
 SEV_RANK = {"critical": 0, "warning": 1, "info": 2, "unknown": 3}
 
 def _sev_emoji(sev: str) -> str:
@@ -632,10 +434,7 @@ def _merge_lists(a: Optional[List[str]], b: Optional[List[str]], cap: int) -> Li
     return out
 
 def merge_chunk_results(chunks: List[Dict]) -> Dict:
-    agg = {
-        "kpis": {"critical": 0, "warning": 0, "info": 0, "unknown": 0, "noise": 0},
-        "groups": {}
-    }
+    agg = {"kpis": {"critical": 0, "warning": 0, "info": 0, "unknown": 0, "noise": 0}, "groups": {}}
     for ch in chunks:
         k = ch.get("kpis", {})
         for key in agg["kpis"].keys():
@@ -644,10 +443,10 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
             product = g.get("product") or "Unknown"
             title = g.get("title") or preview(g.get("summary", ""), 60)
             sev = (g.get("severity") or "Unknown").capitalize()
-            key = (product, title, sev)
-            item = agg["groups"].get(key)
+            kkey = (product, title, sev)
+            item = agg["groups"].get(kkey)
             if not item:
-                agg["groups"][key] = {
+                agg["groups"][kkey] = {
                     "product": product,
                     "title": title,
                     "summary": g.get("summary", ""),
@@ -662,8 +461,8 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
                 }
             else:
                 item["occurrences"] += int(g.get("occurrences", 1) or 1)
-                # earliest first_seen, latest last_seen
-                def _p(s): 
+
+                def _p(s):
                     if not s: return None
                     try:
                         d = dt.datetime.fromisoformat(s.replace("Z","+00:00"))
@@ -679,8 +478,10 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
                 ls_new = _p(g.get("last_seen_utc"))
                 if ls_existing is None or (ls_new and ls_new > ls_existing):
                     item["last_seen_utc"] = g.get("last_seen_utc")
+
                 if len(g.get("summary", "")) > len(item.get("summary", "")):
                     item["summary"] = g.get("summary")
+
                 item["suggested_actions"] = _merge_lists(item.get("suggested_actions"), g.get("suggested_actions"), 8)
                 item["appendix_previews"] = _merge_lists(item.get("appendix_previews"), g.get("appendix_previews"), 20)
                 ent = item.setdefault("entities", {})
@@ -708,12 +509,10 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
 
     lines: List[str] = []
     _add(lines, "## 🛡️ SRE Digest")
-    _add(lines)
     _add(lines, f"**Timestamp ({OUTPUT_TIMEZONE}):** {now_local}")
     _add(lines, f"**Window:** {window_label}")
     _add(lines, "**Deduplicated Alerts/Incidents:** ✅")
-    _add(lines)
-
+    _add(lines, "")
     k = agg.get("kpis", {})
     _add(lines, "## Summary KPIs")
     _add(lines, f"- **🧮 Total alerts:** {k.get('total_alerts', 0)}")
@@ -721,33 +520,24 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
     _add(lines, f"- **🟠 Warning:** {k.get('warning', 0)}")
     _add(lines, f"- **🔵 Info:** {k.get('info', 0)}")
     _add(lines, f"- **⚪ Other:** {k.get('unknown', 0)}  _(Noise: {k.get('noise', 0)})_")
-    _add(lines)
+    _add(lines, "")
 
-    # group by product for display
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
         by_product.setdefault(g["product"], []).append(g)
 
-    # quick listing of GovMeetings vs Other
-    gm_set = set()
-    other_set = set()
+    gm_set, other_set = set(), set()
     for prod in by_product.keys():
         is_gm, canon = is_govmeetings_product(prod)
-        if is_gm:
-            gm_set.add(canon)
-        else:
-            if _norm_product_name(prod) != "Unknown":
-                other_set.add(prod)
+        (gm_set if is_gm else other_set).add(canon if is_gm else (prod if _norm_product_name(prod)!="Unknown" else ""))
 
     _add(lines, "### GovMeetings products in this window")
-    _add(lines, "- " + (", ".join(sorted(gm_set)) if gm_set else "_None detected_"))
+    _add(lines, "- " + (", ".join(sorted(filter(None, gm_set))) if gm_set else "_None detected_"))
     _add(lines, "### Other products")
-    _add(lines, "- " + (", ".join(sorted(other_set)) if other_set else "_None_"))
-    _add(lines)
+    _add(lines, "- " + (", ".join(sorted(filter(None, other_set))) if other_set else "_None_"))
+    _add(lines, "")
 
-    # sort products by GovMeetings-first, then worst severity, then name
     products_sorted = sorted(by_product.items(), key=_govmeetings_first_key)
-
     for product, items in products_sorted:
         _add(lines, f"### 📦 Product — {product}")
         items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), -int(x.get('occurrences', 1)), x.get('title','')))
@@ -760,47 +550,39 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             ls = g.get("last_seen_utc") or ""
             component = g.get("component") or "—"
             ent = g.get("entities") or {}
+            hosts = ent.get("affected_hosts") or []
             nodes = ent.get("rebooted_nodes") or []
             mags = ent.get("swagit_mag_ids") or []
-            hosts = ent.get("affected_hosts") or []
 
-            # NO giant H1/H2 per alert; just bold line
             _add(lines, f"**{emoji} {title}**")
             _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
             _add(lines, f"- **Component:** _{component}_")
-            if nodes:
-                _add(lines, f"- **Affected/Rebooted Nodes:** {', '.join(nodes)}")
-            if mags:
-                _add(lines, f"- **Swagit MAG:** {', '.join(mags)}")
-            if hosts and not nodes:
-                _add(lines, f"- **Affected Hosts:** {', '.join(hosts[:10])}")
+            if hosts: _add(lines, f"- **Affected Hosts:** {', '.join(hosts[:10])}")
+            if nodes: _add(lines, f"- **Rebooted Nodes:** {', '.join(nodes)}")
+            if mags:  _add(lines, f"- **Swagit MAG:** {', '.join(mags)}")
             _add(lines, f"- **Occurrences:** {occ}")
             _add(lines, f"- **First Seen (UTC):** {fs}")
             _add(lines, f"- **Last Seen (UTC):** {ls}")
             _add(lines, f"- **Summary:** {summ}")
-
             actions = g.get("suggested_actions") or []
             if actions:
                 _add(lines, "**Suggested Action Items**")
                 for a in actions:
                     _add(lines, f"- [ ] {a}")
-            _add(lines)
-        _add(lines)
+            _add(lines, "")
+        _add(lines, "")
 
-    # Appendix (flat list from all groups)
     all_previews = []
     for (_, _, _), g in agg.get("groups", {}).items():
         for p in (g.get("appendix_previews") or [])[:3]:
             all_previews.append(p)
-
     if all_previews:
         _add(lines, "## 📎 Appendix — Grouped Alert Previews")
         for p in all_previews[:50]:
             _add(lines, f"- {p}")
-        _add(lines)
+        _add(lines, "")
 
-    _add(lines, f"🕒 Last update: {now_local} – next update at {next_local}")
-
+    _add(lines, f"🕒 Last update: {now_local} – next update at {fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), get_output_tz())}")
     md = "\n".join(lines).strip()
     if len(md) > TEAMS_MAX_CHARS:
         md = md[:TEAMS_MAX_CHARS - 2000] + "\n\n_(truncated to fit Teams limit)_"
@@ -810,13 +592,11 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
     tz_obj = get_output_tz()
     now_local = fmt_in_tz_compact(now_utc(), tz_obj)
     next_local = fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), tz_obj)
-
     lines: List[str] = []
     _add(lines, "## 🛡️ SRE Digest (Lite)")
     _add(lines, f"Window: {window_label}")
     _add(lines, f"Last update: {now_local} • Next: {next_local}")
-    _add(lines)
-
+    _add(lines, "")
     k = agg.get("kpis", {})
     _add(lines, "**Summary**")
     _add(lines, f"- 🧮 Total alerts: {k.get('total_alerts', 0)}")
@@ -824,27 +604,22 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
     _add(lines, f"- 🟠 Warning: {k.get('warning', 0)}")
     _add(lines, f"- 🔵 Info: {k.get('info', 0)}")
     _add(lines, f"- ⚪ Other: {k.get('unknown', 0)}  (Noise: {k.get('noise', 0)})")
-    _add(lines)
+    _add(lines, "")
 
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
         by_product.setdefault(g["product"], []).append(g)
 
-    gm_set = set()
-    other_set = set()
+    gm_set, other_set = set(), set()
     for prod in by_product.keys():
         is_gm, canon = is_govmeetings_product(prod)
-        if is_gm:
-            gm_set.add(canon)
-        else:
-            if _norm_product_name(prod) != "Unknown":
-                other_set.add(prod)
+        (gm_set if is_gm else other_set).add(canon if is_gm else (prod if _norm_product_name(prod)!="Unknown" else ""))
 
     _add(lines, "### GovMeetings products in this window")
-    _add(lines, "- " + (", ".join(sorted(gm_set)) if gm_set else "_None detected_"))
+    _add(lines, "- " + (", ".join(sorted(filter(None, gm_set))) if gm_set else "_None detected_"))
     _add(lines, "### Other products")
-    _add(lines, "- " + (", ".join(sorted(other_set)) if other_set else "_None_"))
-    _add(lines)
+    _add(lines, "- " + (", ".join(sorted(filter(None, other_set))) if other_set else "_None_"))
+    _add(lines, "")
 
     products_sorted = sorted(by_product.items(), key=_govmeetings_first_key)
     for product, items in products_sorted:
@@ -857,16 +632,119 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
             occ = g.get("occurrences", 1)
             fs = g.get("first_seen_utc") or ""
             ls = g.get("last_seen_utc") or ""
-            _add(lines, f"- {emoji} **{title}** — {summ}  _(x{occ}; {fs} → {ls})_")
-        _add(lines)
+            ent = g.get("entities") or {}
+            hosts = ent.get("affected_hosts") or []
+            host_txt = f" • Hosts: {', '.join(hosts[:5])}" if hosts else ""
+            _add(lines, f"- {emoji} **{title}** — {summ}{host_txt}  _(x{occ}; {fs} → {ls})_")
+        _add(lines, "")
 
     md = "\n".join(lines).strip()
     if len(md) > TEAMS_MAX_CHARS:
         md = md[:TEAMS_MAX_CHARS - 2000] + "\n\n_(truncated to fit Teams limit)_"
     return md
 
-# ---- Teams Posting ----
+# ---- Collection & stats logging ----
+def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
+    doc = {"tag": "DIGEST_COLLECTION_STATS", "window_start_utc": iso_z(start_utc), "window_end_utc": iso_z(end_utc), **stats}
+    if skipped_time_samples:
+        doc["skipped_time_samples"] = skipped_time_samples
+    logger.info(json.dumps(doc, cls=DateTimeEncoder))
 
+def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) -> List[Dict]:
+    alerts: List[Dict] = []
+    stats = {
+        "objects_listed": 0, "objects_read": 0, "lines_scanned": 0, "lines_valid": 0,
+        "lines_skipped_blank": 0, "lines_skipped_time": 0, "lines_parse_errors": 0, "cap_hit": False,
+    }
+    skipped_time_samples = []
+    day = start_utc.date()
+    while day <= end_utc.date():
+        for key, size in iter_day_objects(ALERTS_BUCKET, day):
+            stats["objects_listed"] += 1
+            if not (key.endswith(".jsonl") or key.endswith(".jsonl.gz")):
+                continue
+            stats["objects_read"] += 1
+            if DEBUG_MODE:
+                logger.info(f"Reading {key} ({size} bytes)")
+            for rec in read_jsonl_object(ALERTS_BUCKET, key):
+                stats["lines_scanned"] += 1
+                body = rec.get("body", "") or (rec.get("raw_event") or {}).get("text", "") or ""
+                if not body or not body.strip():
+                    stats["lines_skipped_blank"] += 1
+                    continue
+
+                ts_raw = rec.get("event_ts_utc") or rec.get("ingestion_ts_utc")
+                try:
+                    ts = dt.datetime.fromisoformat((ts_raw or "").replace("Z", "+00:00")) if ts_raw else None
+                    if ts and ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=UTC)
+                    if ts:
+                        ts = ts.astimezone(UTC)
+                except Exception:
+                    ts = None
+                    stats["lines_parse_errors"] += 1
+                if ts is None or ts < start_utc or ts > end_utc:
+                    stats["lines_skipped_time"] += 1
+                    if LOG_SKIPPED_TIME and len(skipped_time_samples) < SKIPPED_TIME_LIMIT:
+                        skipped_time_samples.append({
+                            "messageId": rec.get("messageId"),
+                            "event_ts_utc": ts_raw,
+                            "parsed": iso_z(ts) if ts else None,
+                            "reason": "null_or_outside_window",
+                            "window_start_utc": iso_z(start_utc),
+                            "window_end_utc": iso_z(end_utc)
+                        })
+                    continue
+
+                norm_sev = derive_severity(rec)
+                if should_skip_unknown(rec, body, norm_sev):
+                    continue
+
+                alerts.append({
+                    "messageId": rec.get("messageId", "unknown"),
+                    "body": body,
+                    "fromDisplay": rec.get("fromDisplay")
+                                   or (rec.get("raw_event") or {}).get("fromDisplay")
+                                   or rec.get("source") or rec.get("source_system") or "",
+                    "channel": extract_channel(rec),
+                    "event_ts_utc": ts_raw,
+                    "norm_severity": norm_sev,
+                    "product": infer_product(rec)
+                })
+                stats["lines_valid"] += 1
+                if len(alerts) >= cap:
+                    stats["cap_hit"] = True
+                    if DEBUG_MODE:
+                        logger.info(f"Hit cap {cap}, stopping collection")
+                    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
+                    return alerts
+        day += dt.timedelta(days=1)
+    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
+    return alerts
+
+def log_alert_details(alerts: List[Dict]):
+    if not (DEBUG_MODE and LOG_ALERT_DETAIL):
+        return
+    limit = min(ALERT_LOG_LIMIT, len(alerts))
+    logger.info(f"Logging first {limit} alerts (of {len(alerts)}) for digest debug")
+    for i, a in enumerate(alerts[:limit]):
+        body_preview = preview(a.get("body", ""), 140)
+        logger.info(json.dumps({
+            "tag": "ALERT_FOR_DIGEST",
+            "idx": i,
+            "messageId": a.get("messageId"),
+            "event_ts_utc": a.get("event_ts_utc"),
+            "from": a.get("fromDisplay"),
+            "channel": a.get("channel"),
+            "norm_severity": a.get("norm_severity"),
+            "product": a.get("product"),
+            "body_preview": body_preview,
+            "body_hash": body_hash(a.get("body", "")),
+        }, cls=DateTimeEncoder))
+    if len(alerts) > limit:
+        logger.info(f"(Suppressed {len(alerts) - limit} additional alerts; increase ALERT_LOG_LIMIT to see more)")
+
+# ---- Teams Posting ----
 def post_markdown_to_teams(markdown: str) -> bool:
     try:
         data = json.dumps({"text": markdown}, ensure_ascii=False).encode("utf-8")
@@ -880,10 +758,8 @@ def post_markdown_to_teams(markdown: str) -> bool:
         return False
 
 # ---- Lambda Handler ----
-
 def lambda_handler(event, context):
     logger.info(f"Digest start event={json.dumps(event or {}, cls=DateTimeEncoder)}")
-
     event = event or {}
     interval_minutes = int(event.get("minutes", DIGEST_INTERVAL_MINUTES_DEFAULT))
 
@@ -905,10 +781,9 @@ def lambda_handler(event, context):
         try:
             start_utc = dt.datetime.fromisoformat((win_override["start_utc"] or '').replace("Z", "+00:00")).astimezone(UTC)
             end_utc = dt.datetime.fromisoformat((win_override["end_utc"] or '').replace("Z", "+00:00")).astimezone(UTC)
-            tz_obj = get_output_tz()
-            window_label = f"{fmt_in_tz_compact(start_utc, tz_obj)} - {fmt_in_tz_compact(end_utc, tz_obj)} {OUTPUT_TIMEZONE}"
+            window_label = f"{fmt_in_tz_compact(start_utc, get_output_tz())} - {fmt_in_tz_compact(end_utc, get_output_tz())} {OUTPUT_TIMEZONE}"
         except Exception as e:
-            logger.warning(f"Invalid window override: {e}; falling back to computed window")
+            logger.warning(f"Invalid window override: {e}; falling back")
             start_utc, end_utc, window_label = get_window_bounds(prev_end_utc, interval_minutes)
     else:
         start_utc, end_utc, window_label = get_window_bounds(prev_end_utc, interval_minutes)
@@ -919,7 +794,7 @@ def lambda_handler(event, context):
     try:
         import os as _os
         if _os.path.exists(_os.path.join(_os.path.dirname(__file__), 's3-digest.py')):
-            logger.warning("Legacy file s3-digest.py present; ensure Lambda handler set to s3_digest_lite.lambda_handler")
+            logger.warning("Legacy file s3-digest.py present; ensure handler is this module's lambda_handler")
     except Exception:
         pass
 
@@ -944,7 +819,6 @@ def lambda_handler(event, context):
     session_id = "s3-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
     chunks = list(chunk_list(alerts, MAX_BODIES_PER_CALL))
 
-    # PARALLEL Bedrock calls
     results: List[Dict] = [None] * len(chunks)
     max_workers = min(BEDROCK_CONCURRENCY, len(chunks)) or 1
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -971,7 +845,7 @@ def lambda_handler(event, context):
 
     agg = merge_chunk_results([r or {"kpis": {}, "groups": []} for r in results])
 
-    # Add reliable Total alerts KPI AFTER filtering
+    # Reliable Total alerts AFTER filtering
     agg.setdefault("kpis", {})
     agg["kpis"]["total_alerts"] = len(alerts)
 
