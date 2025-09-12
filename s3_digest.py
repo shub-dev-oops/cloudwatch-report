@@ -570,6 +570,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             _add(lines, f"- **Last Seen (UTC):** {ls}")
             _add(lines, f"- **Summary:** {summ}")
             actions = g.get("suggested_actions") or []
+            _add(lines)
             if actions:
                 _add(lines, "**Suggested Action Items**")
                 for a in actions:
