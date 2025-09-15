@@ -560,7 +560,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             else:
                 display_title = f"{product} - {title}" if product not in {"Unknown", ""} else title
             _add(lines, f"**{emoji} {display_title}**")
-            _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
+            _add(lines, f"- **Severity:** _{g.get('severity')}_")
             _add(lines, f"- **Component:** _{component}_")
             if hosts: _add(lines, f"- **Affected Hosts:** {', '.join(hosts[:10])}")
             if nodes: _add(lines, f"- **Rebooted Nodes:** {', '.join(nodes)}")
