@@ -23,9 +23,10 @@ TEAMS_WEBHOOK = os.environ["TEAMS_WEBHOOK"]
 
 # Core behavior
 DIGEST_INTERVAL_MINUTES_DEFAULT = int(os.environ.get("DIGEST_INTERVAL_MINUTES", "90"))
-OUTPUT_TIMEZONE = os.environ.get("OUTPUT_TIMEZONE", "UTC")  # set to "Asia/Kolkata" for IST
+OUTPUT_TIMEZONE = os.environ.get("OUTPUT_TIMEZONE", "Asia/Kolkata")  # Default IST
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
 MAX_BODIES_PER_CALL = int(os.environ.get("MAX_BODIES_PER_CALL", "90"))
+# Render style: set to false for full, true for ultra-compact
 LITE_DIGEST = os.environ.get("LITE_DIGEST", "false").lower() == "true"
 
 # Concurrency & retries
@@ -119,16 +120,64 @@ def _norm(s: Optional[str]) -> str:
 def _norm_product_name(p: Optional[str]) -> str:
     return (p or "Unknown").strip()
 
-# ---- GovMeetings family detection (robust) ----
-# Returns (is_family, canonical_subproduct_or_family)
-# - If a subproduct found → (True, "Legistar"/"OneMeeting"/"iLegislate"/"MediaManager"/"Peak"/"UFC"/"Swagit")
-# - If only family found → (True, "GovMeetings")
-# - Else → (False, original or "Unknown")
+# ---- Severity ----
+def _normalize_sev_name(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    sl = s.strip().lower()
+    if sl in {"critical", "crit", "p1", "sev1"}:
+        return "Critical"
+    if sl in {"warning", "warn", "p2", "sev2"}:
+        return "Warning"
+    # We intentionally do not surface Info in KPIs per requirement
+    return None
+
+def extract_channel(rec: Dict[str, Any]) -> str:
+    ch = rec.get("channel") or (rec.get("raw_event") or {}).get("channel") or rec.get("teams_channel") or rec.get("room")
+    return str(ch or "")
+
+def derive_severity(rec: Dict) -> str:
+    """
+    Priority:
+      1. rec["severity"] short/long codes
+      2. rec["raw_event"]["severity"]
+      3. channel exact match in CRITICAL_CHANNELS / WARNING_CHANNELS env
+      4. keyword hints over channel name
+      5. else "Unknown"
+    """
+    # 1 & 2: explicit severity fields
+    for candidate in [rec.get("severity"), (rec.get("raw_event") or {}).get("severity")]:
+        sev_norm = _normalize_sev_name(candidate)
+        if sev_norm:
+            return sev_norm
+
+    # 3: channel exact match (env-controlled)
+    ch_name = extract_channel(rec).strip().lower()
+    if ch_name in CRITICAL_CHANNELS:
+        return "Critical"
+    if ch_name in WARNING_CHANNELS:
+        return "Warning"
+
+    # 4: hints
+    if any(h in ch_name for h in CRITICAL_CHANNEL_HINTS):
+        return "Critical"
+    if any(h in ch_name for h in WARNING_CHANNEL_HINTS):
+        return "Warning"
+
+    return "Unknown"
+
+def _sev_emoji(sev: str) -> str:
+    s = (sev or "").lower()
+    if s == "critical":
+        return "🔴"
+    if s == "warning":
+        return "🟠"
+    return "⚪"  # Unknown or anything else
+
+# ---- GovMeetings product detection ----
 def is_govmeetings_product(product_or_text: str) -> Tuple[bool, str]:
     s = (product_or_text or "").strip()
     sl = s.lower()
-    family_hit = ("govmeetings" in sl) or ("govmeeting" in sl)
-
     submap = {
         "onemeeting": "OneMeeting",
         "legistar": "Legistar",
@@ -141,75 +190,17 @@ def is_govmeetings_product(product_or_text: str) -> Tuple[bool, str]:
     for k, v in submap.items():
         if k in sl:
             return True, v
-
-    if family_hit:
+    if "govmeeting" in sl or "govmeetings" in sl:
         return True, "GovMeetings"
-
     return False, s or "Unknown"
 
-# ---- Channel & product extraction ----
-def extract_channel(rec: Dict[str, Any]) -> str:
-    ch = rec.get("channel") or rec.get("teams_channel") or rec.get("room")
-    if ch:
-        return str(ch)
-    raw = rec.get("raw_event") or {}
-    ch = raw.get("channel") or raw.get("channelName") or raw.get("channelId")
-    return str(ch or "")
-
-def _normalize_sev_name(s: str) -> Optional[str]:
-    if not s:
-        return None
-    sl = s.strip().lower()
-    if sl in {"critical", "crit", "p1", "sev1"}:
-        return "Critical"
-    if sl in {"warning", "warn", "p2", "sev2"}:
-        return "Warning"
-    if sl in {"info", "information", "informational"}:
-        return "Info"
-    return None
-
-
-
-def derive_severity(rec: Dict) -> str:
-    # 1) direct severity in JSONL (crit/warn/etc)
-    raw_sev = rec.get("severity") or (rec.get("raw_event") or {}).get("severity")
-    sev_norm = _normalize_sev_name(raw_sev)
-    if sev_norm:
-        return sev_norm
-
-    # 2) channel-based fallback
-    ch_name = extract_channel(rec).strip().lower()
-    if ch_name in CRITICAL_CHANNELS:
-        return "Critical"
-    if ch_name in WARNING_CHANNELS:
-        return "Warning"
-
-    # 3) explicit normalized_severity if present
-    sev_norm = _normalize_sev_name(rec.get("normalized_severity"))
-    if sev_norm:
-        return sev_norm
-
-    # 4) keyword hints
-    channelish = " ".join(filter(None, [
-        extract_channel(rec),
-        rec.get("teams_channel"), rec.get("fromDisplay"),
-        rec.get("source"), rec.get("source_system"), rec.get("team"), rec.get("room")
-    ])).lower()
-    if any(h in channelish for h in CRITICAL_CHANNEL_HINTS):
-        return "Critical"
-    if any(h in channelish for h in WARNING_CHANNEL_HINTS):
-        return "Warning"
-
-    return "Unknown"
-
 def infer_product(rec: Dict) -> str:
-    # Prefer explicit
+    # Prefer explicit fields if present
     p = (rec.get("product") or rec.get("service") or "").strip()
-    ch = (extract_channel(rec) or "")
+    ch = extract_channel(rec)
     fr = rec.get("fromDisplay") or (rec.get("raw_event") or {}).get("fromDisplay") \
          or rec.get("source") or rec.get("source_system") or ""
     body = (rec.get("body") or (rec.get("raw_event") or {}).get("text") or "")
-
     combo = " | ".join([p, ch, fr, body])
 
     # PRODUCT_ALIASES first
@@ -217,13 +208,14 @@ def infer_product(rec: Dict) -> str:
         if key.lower() in combo.lower():
             return val
 
-    # Detect GovMeetings subproduct/family anywhere in fields
+    # GovMeetings family/subproduct detection
     is_gm, canon = is_govmeetings_product(combo)
     if is_gm:
-        return canon  # Legistar / GovMeetings / etc.
+        return canon
 
     return p or fr or "Unknown"
 
+# ---- Attachment filtering for trivial unknowns ----
 def is_trivial_text(txt: str) -> bool:
     t = (txt or "").strip()
     return t == "" or t in {"<p>\\</p>", "<p></p>", "\\", "-", "."}
@@ -246,6 +238,12 @@ def attachments_all_unknown(atts: List[Dict]) -> bool:
     return True
 
 def should_skip_unknown(rec: Dict, body: str, sev: str) -> bool:
+    """
+    Skip if:
+      - severity remained Unknown
+      - and text is trivial/empty
+      - and attachments are all unknown/generic
+    """
     text = (rec.get("raw_event") or {}).get("text") or body
     atts = attachments_list(rec)
     return (sev == "Unknown") and is_trivial_text(text) and attachments_all_unknown(atts)
@@ -331,14 +329,14 @@ JSON_INSTRUCTION = (
     "You are an SRE assistant summarizing alerts into structured JSON for a markdown digest.\n"
     "Rules:\n"
     "- Do NOT invent facts.\n"
-    "- Use 'channel_severity' as the severity for all items.\n"
-    "- Extract hosts from free text (tokens that look like hostnames/IPs/FQDNs such as 'azmop-legweb2.obp.dc.gdi'), and put them in entities.affected_hosts (dedup, cap 20).\n"
-    "- Extract 'component' if any hint like 'component:', 'service:', 'group:' suggests one (short string).\n"
-    "- Group similar items (same problem) into a single group.\n"
-    "- For each group, produce a concise title, one-sentence summary, and up to 5 suggested_actions.\n"
+    "- Use the provided 'resolved_severity' as the severity for all items.\n"
+    "- Extract hosts from free text (tokens that look like hostnames/IPs/FQDNs), and put them in entities.affected_hosts (dedup, cap 20).\n"
+    "- If text hints like 'component:' or 'group:' exist, set 'component' concisely.\n"
+    "- Group very similar items (same problem) into a single group.\n"
+    "- For each group, produce a concise title, a single-sentence summary, and up to 5 suggested_actions.\n"
     "- If product is blank or 'Unknown', infer from text if obvious, else leave as 'Unknown'.\n"
     "Respond ONLY with JSON matching this schema: {\n"
-    "  kpis: {critical:number, warning:number, info:number, unknown:number, noise:number},\n"
+    "  kpis: {critical:number, warning:number, unknown:number, noise:number},\n"
     "  groups: [{product:string, title:string, summary:string, severity:string, component?:string|null,\n"
     "           first_seen_utc:string, last_seen_utc:string, occurrences:number,\n"
     "           suggested_actions?:string[], appendix_previews?:string[],\n"
@@ -397,7 +395,7 @@ def invoke_bedrock_json(session_id: str,
         "channel": a.get("channel", ""),
         "body": a["body"],
         "event_ts_utc": a.get("event_ts_utc"),
-        "channel_severity": a.get("norm_severity"),
+        "resolved_severity": a.get("norm_severity"),
         "product": a.get("product", "Unknown"),
     } for a in alerts]
 
@@ -420,7 +418,7 @@ def invoke_bedrock_json(session_id: str,
     if DEBUG_MODE and log_s3:
         try:
             req_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/request-chunk-{chunk_index:03d}.json"
-            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=body_bytes, ContentType='application/json')
+            log_s3.put_object(Bucket=BEDROOCK_LOGS_S3_BUCKET, Key=req_key, Body=body_bytes, ContentType='application/json')  # type: ignore
             req_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': req_key}, ExpiresIn=86400)
         except Exception as e:
             logger.error(f"Failed saving bedrock request: {e}")
@@ -456,18 +454,8 @@ def invoke_bedrock_json(session_id: str,
         logger.error(f"Bedrock invoke error: {e}")
         return {"kpis": {}, "groups": []}
 
-# ---- Merge, KPI recompute & Render ----
-SEV_RANK = {"critical": 0, "warning": 1, "info": 2, "unknown": 3}
-
-def _sev_emoji(sev: str) -> str:
-    s = (sev or "").lower()
-    if s == "critical":
-        return "🔴"
-    if s == "warning":
-        return "🟠"
-    if s == "info":
-        return "🔵"
-    return "⚪"
+# ---- Merge, filter & KPI recompute ----
+SEV_RANK = {"critical": 0, "warning": 1, "unknown": 2}
 
 def _merge_lists(a: Optional[List[str]], b: Optional[List[str]], cap: int) -> List[str]:
     out, seen = [], set()
@@ -484,7 +472,7 @@ def _merge_lists(a: Optional[List[str]], b: Optional[List[str]], cap: int) -> Li
     return out
 
 def merge_chunk_results(chunks: List[Dict]) -> Dict:
-    agg = {"kpis": {"critical": 0, "warning": 0, "info": 0, "unknown": 0, "noise": 0}, "groups": {}}
+    agg = {"kpis": {"critical": 0, "warning": 0, "unknown": 0, "noise": 0}, "groups": {}}
     for ch in chunks:
         for g in ch.get("groups", []):
             product = g.get("product") or "Unknown"
@@ -537,15 +525,25 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
                     ent[k_merge] = _merge_lists(ent.get(k_merge), g_ent.get(k_merge), capn)
     return agg
 
-def recompute_group_kpis(merged_groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, int]:
-    out = {"critical": 0, "warning": 0, "info": 0, "unknown": 0, "noise": 0}
-    for (_, _, _), g in merged_groups.items():
+def filter_groups_excluding_unknown_products(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dict[Tuple[str, str, str], Dict]:
+    """Return a new dict with groups whose product != 'Unknown' (case-insensitive)."""
+    out = {}
+    for k, v in groups_map.items():
+        if _norm_product_name(v.get("product")).lower() != "unknown":
+            out[k] = v
+    return out
+
+def recompute_group_kpis(groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, int]:
+    # Sum occurrences by severity; buckets are Critical, Warning, Unknown (Info removed)
+    out = {"critical": 0, "warning": 0, "unknown": 0, "noise": 0}
+    for (_, _, _), g in groups.items():
         sev = (g.get("severity") or "Unknown").lower()
         occ = int(g.get("occurrences", 1) or 1)
         if sev in out:
             out[sev] += occ
         else:
             out["unknown"] += occ
+    out["total_alerts"] = out["critical"] + out["warning"] + out["unknown"]  # exact sum of displayed buckets
     return out
 
 def _rank_for_product(groups: List[Dict]) -> int:
@@ -568,36 +566,34 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
 
     lines: List[str] = []
     _add(lines, "## 🛡️ SRE Digest")
-    _add(lines, f"**Timestamp ({OUTPUT_TIMEZONE}):** {now_local}")
     _add(lines, f"**Window:** {window_label}")
-    _add(lines, "**Deduplicated Alerts/Incidents:** ✅")
+    _add(lines, f"**Timestamp ({OUTPUT_TIMEZONE}):** {now_local}")
     _add(lines, "")
 
     k = agg.get("kpis", {})
-    _add(lines, "## Summary KPIs (grouped items)")
-    _add(lines, f"- **🧮 Total alerts:** {k.get('total_alerts', 0)}")
-    _add(lines, f"- **🔴 Critical:** {k.get('critical', 0)}")
-    _add(lines, f"- **🟠 Warning:** {k.get('warning', 0)}")
-    _add(lines, f"- **🔵 Info:** {k.get('info', 0)}")
-    _add(lines, f"- **⚪ Other:** {k.get('unknown', 0)}  _(Noise: {k.get('noise', 0)})_")
-    # Also expose raw total (post-filter, pre-group) for reference
-    if "total_alerts_raw" in k:
-        _add(lines, f"- **🧾 Total alerts (raw):** {k.get('total_alerts_raw', 0)}")
+    _add(lines, "### Summary KPIs")
+    _add(lines, f"- 🔴 Critical: {k.get('critical', 0)}")
+    _add(lines, f"- 🟠 Warning: {k.get('warning', 0)}")
+    _add(lines, f"- ⚪ Other: {k.get('unknown', 0)}")
+    _add(lines, f"- **Total alerts:** {k.get('total_alerts', 0)}")
     _add(lines, "")
 
+    # Group by product, excluding 'Unknown'
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
+        if _norm_product_name(g["product"]).lower() == "unknown":
+            continue
         by_product.setdefault(g["product"], []).append(g)
 
+    # List detected products
     gm_set = set()
     other_set = set()
     for prod in by_product.keys():
         is_gm, canon = is_govmeetings_product(prod)
         if is_gm:
-            gm_set.add(canon)  # could be subproduct or family
+            gm_set.add(canon)
         else:
-            if _norm_product_name(prod) != "Unknown":
-                other_set.add(prod)
+            other_set.add(prod)
 
     _add(lines, "### GovMeetings products in this window")
     _add(lines, "- " + (", ".join(sorted(gm_set)) if gm_set else "_None detected_"))
@@ -605,6 +601,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
     _add(lines, "- " + (", ".join(sorted(other_set)) if other_set else "_None_"))
     _add(lines, "")
 
+    # Sort products: GovMeetings first, then by worst severity then name
     products_sorted = sorted(by_product.items(), key=_govmeetings_first_key)
 
     for product, items in products_sorted:
@@ -623,12 +620,12 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             nodes = ent.get("rebooted_nodes") or []
             mags = ent.get("swagit_mag_ids") or []
 
-            # Prefix GovMeetings family & subproduct into title line
+            # Prefix GovMeetings family/subproduct into title line
             is_gm, _canon = is_govmeetings_product(product)
             display_title = f"GovMeetings - {product}: {title}" if is_gm else title
 
             _add(lines, f"**{emoji} {display_title}**")
-            _add(lines, f"- **Severity:** _{g.get('severity')}_")
+            _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
             _add(lines, f"- **Component:** _{component}_")
             if hosts: _add(lines, f"- **Affected Hosts:** {', '.join(hosts[:10])}")
             if nodes: _add(lines, f"- **Rebooted Nodes:** {', '.join(nodes)}")
@@ -646,17 +643,19 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             _add(lines, "")
         _add(lines, "")
 
+    # Appendix (optional previews)
     all_previews = []
     for (_, _, _), g in agg.get("groups", {}).items():
         for p in (g.get("appendix_previews") or [])[:3]:
             all_previews.append(p)
     if all_previews:
-        _add(lines, "## 📎 Appendix — Grouped Alert Previews")
+        _add(lines, "### 📎 Appendix — Grouped Alert Previews")
         for p in all_previews[:50]:
             _add(lines, f"- {p}")
         _add(lines, "")
 
     _add(lines, f"🕒 Last update: {now_local} – next update at {next_local}")
+
     md = "\n".join(lines).strip()
     if len(md) > TEAMS_MAX_CHARS:
         md = md[:TEAMS_MAX_CHARS - 2000] + "\n\n_(truncated to fit Teams limit)_"
@@ -666,6 +665,7 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
     tz_obj = get_output_tz()
     now_local = fmt_in_tz_compact(now_utc(), tz_obj)
     next_local = fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), tz_obj)
+
     lines: List[str] = []
     _add(lines, "## 🛡️ SRE Digest (Lite)")
     _add(lines, f"Window: {window_label}")
@@ -673,18 +673,17 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
     _add(lines, "")
 
     k = agg.get("kpis", {})
-    _add(lines, "**Summary (grouped items)**")
-    _add(lines, f"- 🧮 Total alerts: {k.get('total_alerts', 0)}")
+    _add(lines, "**Summary (grouped, by occurrences)**")
     _add(lines, f"- 🔴 Critical: {k.get('critical', 0)}")
     _add(lines, f"- 🟠 Warning: {k.get('warning', 0)}")
-    _add(lines, f"- 🔵 Info: {k.get('info', 0)}")
-    _add(lines, f"- ⚪ Other: {k.get('unknown', 0)}  (Noise: {k.get('noise', 0)})")
-    if "total_alerts_raw" in k:
-        _add(lines, f"- 🧾 Total alerts (raw): {k.get('total_alerts_raw', 0)}")
+    _add(lines, f"- ⚪ Other: {k.get('unknown', 0)}")
+    _add(lines, f"- **Total alerts:** {k.get('total_alerts', 0)}")
     _add(lines, "")
 
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
+        if _norm_product_name(g["product"]).lower() == "unknown":
+            continue
         by_product.setdefault(g["product"], []).append(g)
 
     gm_set = set()
@@ -694,8 +693,7 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
         if is_gm:
             gm_set.add(canon)
         else:
-            if _norm_product_name(prod) != "Unknown":
-                other_set.add(prod)
+            other_set.add(prod)
 
     _add(lines, "### GovMeetings products in this window")
     _add(lines, "- " + (", ".join(sorted(gm_set)) if gm_set else "_None detected_"))
@@ -729,18 +727,54 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
         md = md[:TEAMS_MAX_CHARS - 2000] + "\n\n_(truncated to fit Teams limit)_"
     return md
 
-# ---- Collection & stats logging ----
-def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
-    doc = {"tag": "DIGEST_COLLECTION_STATS", "window_start_utc": iso_z(start_utc), "window_end_utc": iso_z(end_utc), **stats}
-    if skipped_time_samples:
-        doc["skipped_time_samples"] = skipped_time_samples
-    logger.info(json.dumps(doc, cls=DateTimeEncoder))
+# ---- Debug Logging of Collected Alerts ----
+def log_alert_details(alerts: List[Dict]):
+    if not (DEBUG_MODE and LOG_ALERT_DETAIL):
+        return
+    limit = min(ALERT_LOG_LIMIT, len(alerts))
+    logger.info(f"Logging first {limit} alerts (of {len(alerts)}) for digest debug")
+    for i, a in enumerate(alerts[:limit]):
+        body_preview = preview(a.get("body", ""), 140)
+        logger.info(json.dumps({
+            "tag": "ALERT_FOR_DIGEST",
+            "idx": i,
+            "messageId": a.get("messageId"),
+            "event_ts_utc": a.get("event_ts_utc"),
+            "from": a.get("fromDisplay"),
+            "channel": a.get("channel"),
+            "norm_severity": a.get("norm_severity"),
+            "product": a.get("product"),
+            "body_preview": body_preview,
+            "body_hash": body_hash(a.get("body", "")),
+        }, cls=DateTimeEncoder))
+    if len(alerts) > limit:
+        logger.info(f"(Suppressed {len(alerts) - limit} additional alerts; increase ALERT_LOG_LIMIT to see more)")
 
+# ---- Teams Posting ----
+def post_markdown_to_teams(markdown: str) -> bool:
+    try:
+        data = json.dumps({"text": markdown}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(TEAMS_WEBHOOK, data=data, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            code = getattr(resp, "status", 200)
+            logger.info(f"Teams post status={code}")
+            return 200 <= code < 300
+    except Exception as e:
+        logger.error(f"Teams post error: {e}")
+        return False
+
+# ---- Collection from S3 ----
 def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) -> List[Dict]:
     alerts: List[Dict] = []
     stats = {
-        "objects_listed": 0, "objects_read": 0, "lines_scanned": 0, "lines_valid": 0,
-        "lines_skipped_blank": 0, "lines_skipped_time": 0, "lines_parse_errors": 0, "cap_hit": False,
+        "objects_listed": 0,
+        "objects_read": 0,
+        "lines_scanned": 0,
+        "lines_valid": 0,
+        "lines_skipped_blank": 0,
+        "lines_skipped_time": 0,
+        "lines_parse_errors": 0,
+        "cap_hit": False,
     }
     skipped_time_samples = []
     day = start_utc.date()
@@ -808,40 +842,11 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
     _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
     return alerts
 
-def log_alert_details(alerts: List[Dict]):
-    if not (DEBUG_MODE and LOG_ALERT_DETAIL):
-        return
-    limit = min(ALERT_LOG_LIMIT, len(alerts))
-    logger.info(f"Logging first {limit} alerts (of {len(alerts)}) for digest debug")
-    for i, a in enumerate(alerts[:limit]):
-        body_preview = preview(a.get("body", ""), 140)
-        logger.info(json.dumps({
-            "tag": "ALERT_FOR_DIGEST",
-            "idx": i,
-            "messageId": a.get("messageId"),
-            "event_ts_utc": a.get("event_ts_utc"),
-            "from": a.get("fromDisplay"),
-            "channel": a.get("channel"),
-            "norm_severity": a.get("norm_severity"),
-            "product": a.get("product"),
-            "body_preview": body_preview,
-            "body_hash": body_hash(a.get("body", "")),
-        }, cls=DateTimeEncoder))
-    if len(alerts) > limit:
-        logger.info(f"(Suppressed {len(alerts) - limit} additional alerts; increase ALERT_LOG_LIMIT to see more)")
-
-# ---- Teams Posting ----
-def post_markdown_to_teams(markdown: str) -> bool:
-    try:
-        data = json.dumps({"text": markdown}, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(TEAMS_WEBHOOK, data=data, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            code = getattr(resp, "status", 200)
-            logger.info(f"Teams post status={code}")
-            return 200 <= code < 300
-    except Exception as e:
-        logger.error(f"Teams post error: {e}")
-        return False
+def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
+    doc = {"tag": "DIGEST_COLLECTION_STATS", "window_start_utc": iso_z(start_utc), "window_end_utc": iso_z(end_utc), **stats}
+    if skipped_time_samples:
+        doc["skipped_time_samples"] = skipped_time_samples
+    logger.info(json.dumps(doc, cls=DateTimeEncoder))
 
 # ---- Lambda Handler ----
 def lambda_handler(event, context):
@@ -849,6 +854,7 @@ def lambda_handler(event, context):
     event = event or {}
     interval_minutes = int(event.get("minutes", DIGEST_INTERVAL_MINUTES_DEFAULT))
 
+    # Load previous state
     state = load_digest_state()
     prev_end_utc = None
     prev_end_iso = None
@@ -862,14 +868,16 @@ def lambda_handler(event, context):
         except Exception as e:
             logger.warning(f"Invalid state.last_end_utc: {state.get('last_end_utc')} ({e})")
 
+    # Compute window (allow override via event.window.start_utc/end_utc ISO8601)
     win_override = event.get("window") or {}
     if win_override.get("start_utc") and win_override.get("end_utc"):
         try:
             start_utc = dt.datetime.fromisoformat((win_override["start_utc"] or '').replace("Z", "+00:00")).astimezone(UTC)
             end_utc = dt.datetime.fromisoformat((win_override["end_utc"] or '').replace("Z", "+00:00")).astimezone(UTC)
-            window_label = f"{fmt_in_tz_compact(start_utc, get_output_tz())} - {fmt_in_tz_compact(end_utc, get_output_tz())} {OUTPUT_TIMEZONE}"
+            tz_obj = get_output_tz()
+            window_label = f"{fmt_in_tz_compact(start_utc, tz_obj)} - {fmt_in_tz_compact(end_utc, tz_obj)} {OUTPUT_TIMEZONE}"
         except Exception as e:
-            logger.warning(f"Invalid window override: {e}; falling back")
+            logger.warning(f"Invalid window override: {e}; falling back to computed window")
             start_utc, end_utc, window_label = get_window_bounds(prev_end_utc, interval_minutes)
     else:
         start_utc, end_utc, window_label = get_window_bounds(prev_end_utc, interval_minutes)
@@ -877,20 +885,14 @@ def lambda_handler(event, context):
     tz_obj = get_output_tz()
     next_local_time = fmt_in_tz_compact(end_utc + dt.timedelta(minutes=interval_minutes), tz_obj)
 
-    try:
-        import os as _os
-        if _os.path.exists(_os.path.join(_os.path.dirname(__file__), 's3-digest.py')):
-            logger.warning("Legacy file s3-digest.py present; ensure handler is this module's lambda_handler")
-    except Exception:
-        pass
-
+    # Collect alerts
     alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
     logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
     log_alert_details(alerts)
 
     if not alerts:
         md = "## 🛡️ SRE Digest\n\n_No alerts/messages found in this window._\n\n" + \
-             f"🕒 Last update: {fmt_in_tz_compact(now_utc(), tz_obj)} – next update at {next_local_time}"
+             f"🕒 Last update: {fmt_in_tz_compact(now_utc(), tz_obj)} • Next: {next_local_time}"
         posted = post_markdown_to_teams(md)
         save_digest_state({
             "last_start_utc": iso_z(start_utc),
@@ -905,6 +907,7 @@ def lambda_handler(event, context):
     session_id = "s3-digest-" + now_utc().strftime("%Y%m%d%H%M%S")
     chunks = list(chunk_list(alerts, MAX_BODIES_PER_CALL))
 
+    # ---- Parallel Bedrock calls ----
     results: List[Dict] = [None] * len(chunks)
     max_workers = min(BEDROCK_CONCURRENCY, len(chunks)) or 1
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -929,18 +932,22 @@ def lambda_handler(event, context):
                 logger.error(f"Chunk {idx} failed: {e}")
                 results[idx] = {"kpis": {}, "groups": []}
 
+    # Merge results
     agg = merge_chunk_results([r or {"kpis": {}, "groups": []} for r in results])
 
-    # KPIs: recompute from groups (displayed items) so totals match the breakdown
-    kpis_display = recompute_group_kpis(agg.get("groups", {}))
-    # Also include raw post-filter total for reference (not used in Total alerts line)
-    kpis_display["total_alerts_raw"] = len(alerts)
+    # Filter out groups with product == Unknown to match display requirements
+    filtered_groups = filter_groups_excluding_unknown_products(agg.get("groups", {}))
+    agg["groups"] = filtered_groups
+
+    # KPIs computed from filtered groups; total is sum of buckets (no mismatch)
+    kpis_display = recompute_group_kpis(filtered_groups)
     agg["kpis"] = kpis_display
-    agg["kpis"] = recompute_group_kpis(agg.get("groups", {}))
-    agg["kpis"]["total_alerts"] = len(alerts)  # raw count from S3, not groups
+
+    # Render & post
     final_md = render_markdown_lite(agg, window_label, interval_minutes) if LITE_DIGEST else render_markdown_full(agg, window_label, interval_minutes)
     posted = post_markdown_to_teams(final_md)
 
+    # Persist new state
     save_digest_state({
         "last_start_utc": iso_z(start_utc),
         "last_end_utc": iso_z(end_utc),
@@ -958,11 +965,11 @@ def lambda_handler(event, context):
         "chunks": len(chunks),
         "session_id": session_id,
         "debug": DEBUG_MODE,
-        "mode": "lite" if LITE_DIGEST else "full"
+        "mode": "lite" if LITE_DIGEST else "full",
+        "kpis": agg["kpis"]
     }
-    if DEBUG_MODE and final_md:
-        out["markdown_chars"] = len(final_md)
     return out
+
 
 if __name__ == "__main__":
     print(json.dumps(lambda_handler({}, None), indent=2))
