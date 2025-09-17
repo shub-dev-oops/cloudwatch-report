@@ -160,34 +160,36 @@ def _normalize_sev_name(s: str) -> Optional[str]:
     if not s:
         return None
     sl = s.strip().lower()
-    if sl in {"critical","crit","p1","sev1"}:
+    if sl in {"critical", "crit", "p1", "sev1"}:
         return "Critical"
-    if sl in {"warning","warn","p2","sev2"}:
+    if sl in {"warning", "warn", "p2", "sev2"}:
         return "Warning"
-    if sl in {"info","information","informational"}:
+    if sl in {"info", "information", "informational"}:
         return "Info"
     return None
 
+
+
 def derive_severity(rec: Dict) -> str:
-    # 1) explicit severity field wins
-    explicit = rec.get("severity") or (rec.get("raw_event") or {}).get("severity")
-    sev_norm = _normalize_sev_name(explicit) if explicit else None
+    # 1) direct severity in JSONL (crit/warn/etc)
+    raw_sev = rec.get("severity") or (rec.get("raw_event") or {}).get("severity")
+    sev_norm = _normalize_sev_name(raw_sev)
     if sev_norm:
         return sev_norm
 
-    # 2) channel-based mapping (authoritative fallback)
+    # 2) channel-based fallback
     ch_name = extract_channel(rec).strip().lower()
     if ch_name in CRITICAL_CHANNELS:
         return "Critical"
     if ch_name in WARNING_CHANNELS:
         return "Warning"
 
-    # 3) normalized_severity from upstream, if present
-    normalized = _normalize_sev_name(rec.get("normalized_severity"))
-    if normalized:
-        return normalized
+    # 3) explicit normalized_severity if present
+    sev_norm = _normalize_sev_name(rec.get("normalized_severity"))
+    if sev_norm:
+        return sev_norm
 
-    # 4) keyword hints in channel-ish text
+    # 4) keyword hints
     channelish = " ".join(filter(None, [
         extract_channel(rec),
         rec.get("teams_channel"), rec.get("fromDisplay"),
@@ -536,16 +538,14 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
     return agg
 
 def recompute_group_kpis(merged_groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, int]:
-    # Count groups by severity (what we display), so KPIs match items listed
     out = {"critical": 0, "warning": 0, "info": 0, "unknown": 0, "noise": 0}
     for (_, _, _), g in merged_groups.items():
         sev = (g.get("severity") or "Unknown").lower()
+        occ = int(g.get("occurrences", 1) or 1)
         if sev in out:
-            out[sev] += 1
+            out[sev] += occ
         else:
-            out["unknown"] += 1
-    # Compute total as sum so it matches displayed breakdown
-    out["total_alerts"] = out["critical"] + out["warning"] + out["info"] + out["unknown"]
+            out["unknown"] += occ
     return out
 
 def _rank_for_product(groups: List[Dict]) -> int:
@@ -936,7 +936,8 @@ def lambda_handler(event, context):
     # Also include raw post-filter total for reference (not used in Total alerts line)
     kpis_display["total_alerts_raw"] = len(alerts)
     agg["kpis"] = kpis_display
-
+    agg["kpis"] = recompute_group_kpis(agg.get("groups", {}))
+    agg["kpis"]["total_alerts"] = len(alerts)  # raw count from S3, not groups
     final_md = render_markdown_lite(agg, window_label, interval_minutes) if LITE_DIGEST else render_markdown_full(agg, window_label, interval_minutes)
     posted = post_markdown_to_teams(final_md)
 
