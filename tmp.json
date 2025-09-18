@@ -4,7 +4,8 @@
   "channelId": "@{triggerOutputs()?['body/channelId']}",
   "createdDateTime": "@{triggerOutputs()?['body/createdDateTime']}",
   "fromDisplay": "@{triggerOutputs()?['body/from/user/displayName']}",
-  "text": "@{triggerOutputs()?['body/body/content']}",
-  "textPlain": "@{outputs('Get_message_details')?['body/body/plainTextContent']}",
-  "textHtml": "@{triggerOutputs()?['body/body/content']}"
+  "textHtml": "@{outputs('GetMessage')?['body']?['body']?['content']}",
+  "textPlain": "@{outputs('GetMessage')?['body']?['body']?['plainTextContent']}",
+  "attachments": "@{outputs('GetMessage')?['body']?['attachments']}",
+  "channel": "govmeeting-crit"
 }
