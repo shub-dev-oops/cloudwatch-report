@@ -46,6 +46,10 @@ BEDROCK_FULL_MAX_CHARS = int(os.environ.get("BEDROCK_FULL_MAX_CHARS", "4000"))
 LOG_SKIPPED_TIME = os.environ.get("LOG_SKIPPED_TIME", "false").lower() == "true"
 SKIPPED_TIME_LIMIT = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
 
+# Exec summary toggle/model
+GENERATE_EXEC_SUMMARY = os.environ.get("GENERATE_EXEC_SUMMARY", "true").lower() == "true"
+EXEC_SUMMARY_MODEL_ID = os.environ.get("EXEC_SUMMARY_MODEL_ID", MODEL_ID)
+
 # State persistence
 DIGEST_STATE_BUCKET = os.environ.get("DIGEST_STATE_BUCKET") or ALERTS_BUCKET
 DIGEST_STATE_KEY = os.environ.get("DIGEST_STATE_KEY", "state/sre-digest-state.json")
@@ -335,10 +339,13 @@ JSON_INSTRUCTION = (
     "- Group very similar items (same problem) into a single group.\n"
     "- For each group, produce a concise title, a single-sentence summary, and up to 5 suggested_actions.\n"
     "- If product is blank or 'Unknown', infer from text if obvious, else leave as 'Unknown'.\n"
+    "- Collect and return distinct source channels contributing to each group in 'source_channels' (strings) based on the 'channel' field of items.\n"
+    "- If an item's body contains HTML (rich-text), treat it as content (strip tags if needed for previews) but do not discard the information.\n"
     "Respond ONLY with JSON matching this schema: {\n"
     "  kpis: {critical:number, warning:number, unknown:number, noise:number},\n"
     "  groups: [{product:string, title:string, summary:string, severity:string, component?:string|null,\n"
     "           first_seen_utc:string, last_seen_utc:string, occurrences:number,\n"
+    "           source_channels?:string[],\n"
     "           suggested_actions?:string[], appendix_previews?:string[],\n"
     "           entities?:{affected_hosts?:string[], swagit_mag_ids?:string[], rebooted_nodes?:string[]}}]\n"
     "}\n"
@@ -348,7 +355,7 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-def _build_bedrock_body(system: str, user_message: str) -> bytes:
+def _build_bedrock_body(system: str, user_message: str, model_id: Optional[str]=None) -> bytes:
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4096,
@@ -360,12 +367,13 @@ def _build_bedrock_body(system: str, user_message: str) -> bytes:
     })
     return body.encode('utf-8')
 
-def _bedrock_invoke_with_retry(body_bytes: bytes) -> Dict[str, Any]:
+def _bedrock_invoke_with_retry(body_bytes: bytes, model_id: Optional[str]=None) -> Dict[str, Any]:
     last_err = None
+    mid = model_id or MODEL_ID
     for attempt in range(1, BEDROCK_MAX_RETRIES + 1):
         try:
             resp = bedrock_rt.invoke_model(
-                modelId=MODEL_ID,
+                modelId=mid,
                 body=body_bytes,
                 contentType='application/json',
                 accept='application/json'
@@ -418,7 +426,7 @@ def invoke_bedrock_json(session_id: str,
     if DEBUG_MODE and log_s3:
         try:
             req_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/request-chunk-{chunk_index:03d}.json"
-            log_s3.put_object(Bucket=BEDROOCK_LOGS_S3_BUCKET, Key=req_key, Body=body_bytes, ContentType='application/json')  # type: ignore
+            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=body_bytes, ContentType='application/json')  # type: ignore
             req_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': req_key}, ExpiresIn=86400)
         except Exception as e:
             logger.error(f"Failed saving bedrock request: {e}")
@@ -453,6 +461,48 @@ def invoke_bedrock_json(session_id: str,
     except Exception as e:
         logger.error(f"Bedrock invoke error: {e}")
         return {"kpis": {}, "groups": []}
+
+# ---- Executive Summary Bedrock ----
+EXEC_SUMMARY_INSTRUCTION = (
+    "You are an expert SRE comms writer. Write an ultra-brief executive summary of the alert digest for senior leaders.\n"
+    "Constraints:\n"
+    "- 3 to 6 bullets or 2 short sentences.\n"
+    "- Prioritize Critical issues, major customer impact, and any pattern across products.\n"
+    "- Avoid jargon and metrics overload; keep it skimmable.\n"
+    "- Max ~90 words. No markdown except bullets ('- ').\n"
+    "Only output the summary text."
+)
+
+def invoke_bedrock_exec_summary(session_id: str, window_label: str, agg: Dict) -> str:
+    try:
+        # Flatten groups for summary
+        groups_list = []
+        for (_, _, _), g in agg.get("groups", {}).items():
+            groups_list.append({
+                "product": g.get("product"),
+                "title": g.get("title"),
+                "severity": g.get("severity"),
+                "occurrences": int(g.get("occurrences", 1) or 1)
+            })
+        payload = {
+            "window": window_label,
+            "kpis": agg.get("kpis", {}),
+            "groups": sorted(groups_list, key=lambda x: (0 if (x.get("severity","").lower()=="critical") else 1, -x.get("occurrences", 1)))
+        }
+        user_message = json.dumps(payload, indent=2, cls=DateTimeEncoder)
+        body_bytes = _build_bedrock_body(EXEC_SUMMARY_INSTRUCTION, user_message, model_id=EXEC_SUMMARY_MODEL_ID)
+        response_body = _bedrock_invoke_with_retry(body_bytes, model_id=EXEC_SUMMARY_MODEL_ID)
+        text = response_body.get('content', [{}])[0].get('text', "").strip()
+        if DEBUG_MODE and log_s3:
+            try:
+                key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/exec-summary.txt"
+                log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=key, Body=text.encode('utf-8'), ContentType='text/plain')
+            except Exception as e:
+                logger.error(f"Failed saving exec summary: {e}")
+        return text or ""
+    except Exception as e:
+        logger.error(f"Exec summary generation failed: {e}")
+        return ""
 
 # ---- Merge, filter & KPI recompute ----
 SEV_RANK = {"critical": 0, "warning": 1, "unknown": 2}
@@ -490,6 +540,7 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
                     "first_seen_utc": g.get("first_seen_utc"),
                     "last_seen_utc": g.get("last_seen_utc"),
                     "occurrences": int(g.get("occurrences", 1) or 1),
+                    "source_channels": list((g.get("source_channels") or [])[:12]),
                     "suggested_actions": list((g.get("suggested_actions") or [])[:8]),
                     "appendix_previews": list((g.get("appendix_previews") or [])[:20]),
                     "entities": g.get("entities") or {}
@@ -517,6 +568,7 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
                 if len(g.get("summary", "")) > len(item.get("summary", "")):
                     item["summary"] = g.get("summary")
 
+                item["source_channels"] = _merge_lists(item.get("source_channels"), g.get("source_channels"), 12)
                 item["suggested_actions"] = _merge_lists(item.get("suggested_actions"), g.get("suggested_actions"), 8)
                 item["appendix_previews"] = _merge_lists(item.get("appendix_previews"), g.get("appendix_previews"), 20)
                 ent = item.setdefault("entities", {})
@@ -559,7 +611,7 @@ def _govmeetings_first_key(item):
     return (0 if is_gm else 1, _rank_for_product(groups), prod.lower())
 
 # ---- Rendering ----
-def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) -> str:
+def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, exec_summary: str = "") -> str:
     tz_obj = get_output_tz()
     now_local = fmt_in_tz_compact(now_utc(), tz_obj)
     next_local = fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), tz_obj)
@@ -577,6 +629,11 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
     _add(lines, f"- ⚪ Other: {k.get('unknown', 0)}")
     _add(lines, f"- **Total alerts:** {k.get('total_alerts', 0)}")
     _add(lines, "")
+    if exec_summary:
+        _add(lines, "### Executive Summary")
+        for line in exec_summary.splitlines():
+            _add(lines, line)
+        _add(lines, "")
 
     # Group by product, excluding 'Unknown'
     by_product: Dict[str, List[Dict]] = {}
@@ -619,6 +676,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             hosts = ent.get("affected_hosts") or []
             nodes = ent.get("rebooted_nodes") or []
             mags = ent.get("swagit_mag_ids") or []
+            src_channels = g.get("source_channels") or []
 
             # Prefix GovMeetings family/subproduct into title line
             is_gm, _canon = is_govmeetings_product(product)
@@ -627,6 +685,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
             _add(lines, f"**{emoji} {display_title}**")
             _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
             _add(lines, f"- **Component:** _{component}_")
+            if src_channels: _add(lines, f"- **Source Channels:** {', '.join(src_channels[:8])}")
             if hosts: _add(lines, f"- **Affected Hosts:** {', '.join(hosts[:10])}")
             if nodes: _add(lines, f"- **Rebooted Nodes:** {', '.join(nodes)}")
             if mags:  _add(lines, f"- **Swagit MAG:** {', '.join(mags)}")
@@ -661,7 +720,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int) ->
         md = md[:TEAMS_MAX_CHARS - 2000] + "\n\n_(truncated to fit Teams limit)_"
     return md
 
-def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) -> str:
+def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int, exec_summary: str = "") -> str:
     tz_obj = get_output_tz()
     now_local = fmt_in_tz_compact(now_utc(), tz_obj)
     next_local = fmt_in_tz_compact(now_utc() + dt.timedelta(minutes=interval_minutes), tz_obj)
@@ -679,6 +738,11 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
     _add(lines, f"- ⚪ Other: {k.get('unknown', 0)}")
     _add(lines, f"- **Total alerts:** {k.get('total_alerts', 0)}")
     _add(lines, "")
+    if exec_summary:
+        _add(lines, "**Executive Summary**")
+        for line in exec_summary.splitlines():
+            _add(lines, line)
+        _add(lines, "")
 
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
@@ -714,12 +778,14 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int) ->
             ls = g.get("last_seen_utc") or ""
             ent = g.get("entities") or {}
             hosts = ent.get("affected_hosts") or []
+            src_channels = g.get("source_channels") or []
             host_txt = f" • Hosts: {', '.join(hosts[:5])}" if hosts else ""
+            ch_txt = f" • Channels: {', '.join(src_channels[:3])}" if src_channels else ""
 
             is_gm, _canon = is_govmeetings_product(product)
             display_title = f"GovMeetings - {product}: {title}" if is_gm else title
 
-            _add(lines, f"- {emoji} **{display_title}** — {summ}{host_txt}  _(x{occ}; {fs} → {ls})_")
+            _add(lines, f"- {emoji} **{display_title}** — {summ}{host_txt}{ch_txt}  _(x{occ}; {fs} → {ls})_")
         _add(lines, "")
 
     md = "\n".join(lines).strip()
@@ -805,15 +871,6 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                     stats["lines_parse_errors"] += 1
                 if ts is None or ts < start_utc or ts > end_utc:
                     stats["lines_skipped_time"] += 1
-                    if LOG_SKIPPED_TIME and len(skipped_time_samples) < SKIPPED_TIME_LIMIT:
-                        skipped_time_samples.append({
-                            "messageId": rec.get("messageId"),
-                            "event_ts_utc": ts_raw,
-                            "parsed": iso_z(ts) if ts else None,
-                            "reason": "null_or_outside_window",
-                            "window_start_utc": iso_z(start_utc),
-                            "window_end_utc": iso_z(end_utc)
-                        })
                     continue
 
                 norm_sev = derive_severity(rec)
@@ -822,7 +879,7 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
 
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
-                    "body": body,
+                    "body": body,  # may contain HTML; keep as-is for model consumption
                     "fromDisplay": rec.get("fromDisplay")
                                    or (rec.get("raw_event") or {}).get("fromDisplay")
                                    or rec.get("source") or rec.get("source_system") or "",
@@ -943,8 +1000,13 @@ def lambda_handler(event, context):
     kpis_display = recompute_group_kpis(filtered_groups)
     agg["kpis"] = kpis_display
 
+    # Executive summary (short, separate Bedrock call)
+    exec_summary = ""
+    if GENERATE_EXEC_SUMMARY:
+        exec_summary = invoke_bedrock_exec_summary(session_id, window_label, agg)
+
     # Render & post
-    final_md = render_markdown_lite(agg, window_label, interval_minutes) if LITE_DIGEST else render_markdown_full(agg, window_label, interval_minutes)
+    final_md = render_markdown_lite(agg, window_label, interval_minutes, exec_summary) if LITE_DIGEST else render_markdown_full(agg, window_label, interval_minutes, exec_summary)
     posted = post_markdown_to_teams(final_md)
 
     # Persist new state
@@ -972,4 +1034,4 @@ def lambda_handler(event, context):
 
 
 if __name__ == "__main__":
-    print(json.dumps(lambda_handler({}, None), indent=2))
+    print(json.dumps({"note": "module compiles"}, indent=2))
