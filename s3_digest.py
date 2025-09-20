@@ -23,10 +23,9 @@ TEAMS_WEBHOOK = os.environ["TEAMS_WEBHOOK"]
 
 # Core behavior
 DIGEST_INTERVAL_MINUTES_DEFAULT = int(os.environ.get("DIGEST_INTERVAL_MINUTES", "90"))
-OUTPUT_TIMEZONE = os.environ.get("OUTPUT_TIMEZONE", "Asia/Kolkata")  # Default IST
+OUTPUT_TIMEZONE = os.environ.get("OUTPUT_TIMEZONE", "Asia/Kolkata")
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "1500"))
 MAX_BODIES_PER_CALL = int(os.environ.get("MAX_BODIES_PER_CALL", "90"))
-# Render style: set to false for full, true for ultra-compact
 LITE_DIGEST = os.environ.get("LITE_DIGEST", "false").lower() == "true"
 
 # Concurrency & retries
@@ -46,9 +45,17 @@ BEDROCK_FULL_MAX_CHARS = int(os.environ.get("BEDROCK_FULL_MAX_CHARS", "4000"))
 LOG_SKIPPED_TIME = os.environ.get("LOG_SKIPPED_TIME", "false").lower() == "true"
 SKIPPED_TIME_LIMIT = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
 
-# Exec summary toggle/model
+# Exec summary
 GENERATE_EXEC_SUMMARY = os.environ.get("GENERATE_EXEC_SUMMARY", "true").lower() == "true"
 EXEC_SUMMARY_MODEL_ID = os.environ.get("EXEC_SUMMARY_MODEL_ID", MODEL_ID)
+
+# Component enrichment
+GENERATE_COMPONENTS = os.environ.get("GENERATE_COMPONENTS", "true").lower() == "true"
+COMPONENT_MODEL_ID = os.environ.get("COMPONENT_MODEL_ID", MODEL_ID)
+
+# Strict GovMeetings filter for alerts_prod channel
+STRICT_GOVM_ONLY_IN_ALERTS_PROD = os.environ.get("STRICT_GOVM_ONLY_IN_ALERTS_PROD", "true").lower() == "true"
+GOVM_EXTRA_KEYWORDS = [t.strip().lower() for t in os.environ.get("GOVM_EXTRA_KEYWORDS", "").split(",") if t.strip()]
 
 # State persistence
 DIGEST_STATE_BUCKET = os.environ.get("DIGEST_STATE_BUCKET") or ALERTS_BUCKET
@@ -65,12 +72,15 @@ WARNING_CHANNELS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNELS
 CRITICAL_CHANNEL_HINTS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNEL_HINTS", "critical,crit,sev1,p1,urgent").split(",") if t.strip()]
 WARNING_CHANNEL_HINTS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNEL_HINTS", "warning,warn,sev2,p2,alert").split(",") if t.strip()]
 
-# Optional product mapping hints (e.g., {"govmeetings":"GovMeetings"})
+# Product aliases (robust, token-based)
 PRODUCT_ALIAS_JSON = os.environ.get("PRODUCT_ALIAS_JSON", "{}")
 try:
-    PRODUCT_ALIASES: Dict[str, str] = json.loads(PRODUCT_ALIAS_JSON)
+    PRODUCT_ALIASES: Dict[str, str] = json.loads(PRODUCT_ALIAS_JSON)  # e.g. {"hypitia": "Hypitia", "gm:legistar": "Legistar"}
 except Exception:
     PRODUCT_ALIASES = {}
+def _norm_key(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+ALIAS_MAP_NORM = {_norm_key(k): v for k, v in PRODUCT_ALIASES.items()}
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -79,7 +89,7 @@ log_s3 = boto3.client("s3") if SAVE_BEDROCK_LOGS and BEDROCK_LOGS_S3_BUCKET else
 
 UTC = dt.timezone.utc
 
-# ---- Encoders & small helpers ----
+# ---- Encoders & helpers ----
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, (dt.datetime, dt.date)):
@@ -133,7 +143,6 @@ def _normalize_sev_name(s: Optional[str]) -> Optional[str]:
         return "Critical"
     if sl in {"warning", "warn", "p2", "sev2"}:
         return "Warning"
-    # We intentionally do not surface Info in KPIs per requirement
     return None
 
 def extract_channel(rec: Dict[str, Any]) -> str:
@@ -141,33 +150,19 @@ def extract_channel(rec: Dict[str, Any]) -> str:
     return str(ch or "")
 
 def derive_severity(rec: Dict) -> str:
-    """
-    Priority:
-      1. rec["severity"] short/long codes
-      2. rec["raw_event"]["severity"]
-      3. channel exact match in CRITICAL_CHANNELS / WARNING_CHANNELS env
-      4. keyword hints over channel name
-      5. else "Unknown"
-    """
-    # 1 & 2: explicit severity fields
     for candidate in [rec.get("severity"), (rec.get("raw_event") or {}).get("severity")]:
         sev_norm = _normalize_sev_name(candidate)
         if sev_norm:
             return sev_norm
-
-    # 3: channel exact match (env-controlled)
     ch_name = extract_channel(rec).strip().lower()
     if ch_name in CRITICAL_CHANNELS:
         return "Critical"
     if ch_name in WARNING_CHANNELS:
         return "Warning"
-
-    # 4: hints
     if any(h in ch_name for h in CRITICAL_CHANNEL_HINTS):
         return "Critical"
     if any(h in ch_name for h in WARNING_CHANNEL_HINTS):
         return "Warning"
-
     return "Unknown"
 
 def _sev_emoji(sev: str) -> str:
@@ -176,9 +171,12 @@ def _sev_emoji(sev: str) -> str:
         return "🔴"
     if s == "warning":
         return "🟠"
-    return "⚪"  # Unknown or anything else
+    return "⚪"
 
 # ---- GovMeetings product detection ----
+GOVM_KEYWORDS = {"govmeeting", "govmeetings", "onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit"}
+GOVM_KEYWORDS |= set(GOVM_EXTRA_KEYWORDS)
+
 def is_govmeetings_product(product_or_text: str) -> Tuple[bool, str]:
     s = (product_or_text or "").strip()
     sl = s.lower()
@@ -198,28 +196,45 @@ def is_govmeetings_product(product_or_text: str) -> Tuple[bool, str]:
         return True, "GovMeetings"
     return False, s or "Unknown"
 
+def _alias_lookup_tokenized(fields: List[str]) -> Optional[str]:
+    # token-level match against ALIAS_MAP_NORM
+    for f in fields:
+        for tok in re.split(r"[^A-Za-z0-9]+", f or ""):
+            if not tok:
+                continue
+            nk = _norm_key(tok)
+            if nk in ALIAS_MAP_NORM:
+                return ALIAS_MAP_NORM[nk]
+    return None
+
 def infer_product(rec: Dict) -> str:
-    # Prefer explicit fields if present
+    # Explicit fields first
     p = (rec.get("product") or rec.get("service") or "").strip()
     ch = extract_channel(rec)
     fr = rec.get("fromDisplay") or (rec.get("raw_event") or {}).get("fromDisplay") \
          or rec.get("source") or rec.get("source_system") or ""
+    tags = rec.get("tags") or (rec.get("raw_event") or {}).get("tags") or []
     body = (rec.get("body") or (rec.get("raw_event") or {}).get("text") or "")
-    combo = " | ".join([p, ch, fr, body])
-
-    # PRODUCT_ALIASES first
-    for key, val in PRODUCT_ALIASES.items():
-        if key.lower() in combo.lower():
-            return val
-
-    # GovMeetings family/subproduct detection
-    is_gm, canon = is_govmeetings_product(combo)
+    explicit_fields = [p, fr] + ([ch] if ch else [])
+    # 1) Exact/alias mapping on explicit fields first (no override by GM)
+    alias = _alias_lookup_tokenized(explicit_fields + list(tags))
+    if alias:
+        return alias
+    # 2) If explicit 'product' is set and not empty, return it as-is (canonize if alias value exists for same key)
+    if p:
+        return p
+    # 3) Try alias in body (HTML allowed) as a fallback
+    alias_body = _alias_lookup_tokenized([body])
+    if alias_body:
+        return alias_body
+    # 4) GovMeetings family/subproduct detection LAST
+    is_gm, canon = is_govmeetings_product(" | ".join([p, ch, fr, body]))
     if is_gm:
         return canon
+    # 5) Last fallback
+    return fr or "Unknown"
 
-    return p or fr or "Unknown"
-
-# ---- Attachment filtering for trivial unknowns ----
+# ---- Attachment/skip helpers ----
 def is_trivial_text(txt: str) -> bool:
     t = (txt or "").strip()
     return t == "" or t in {"<p>\\</p>", "<p></p>", "\\", "-", "."}
@@ -242,15 +257,25 @@ def attachments_all_unknown(atts: List[Dict]) -> bool:
     return True
 
 def should_skip_unknown(rec: Dict, body: str, sev: str) -> bool:
-    """
-    Skip if:
-      - severity remained Unknown
-      - and text is trivial/empty
-      - and attachments are all unknown/generic
-    """
     text = (rec.get("raw_event") or {}).get("text") or body
     atts = attachments_list(rec)
     return (sev == "Unknown") and is_trivial_text(text) and attachments_all_unknown(atts)
+
+# ---- GovM relevance for alerts_prod ----
+def _is_relevant_to_govm_text(s: str) -> bool:
+    sl = (s or "").lower()
+    return any(k in sl for k in GOVM_KEYWORDS)
+
+def is_relevant_to_govm(rec: Dict) -> bool:
+    ch = extract_channel(rec) or ""
+    body = (rec.get("body") or (rec.get("raw_event") or {}).get("text") or "")
+    p = (rec.get("product") or rec.get("service") or "")
+    fr = rec.get("fromDisplay") or (rec.get("raw_event") or {}).get("fromDisplay") or ""
+    combo = " | ".join([ch, p, fr, body])
+    if _is_relevant_to_govm_text(combo):
+        return True
+    # Fallback to detector
+    return is_govmeetings_product(combo)[0]
 
 # ---- State (S3) ----
 def load_digest_state() -> Optional[Dict]:
@@ -328,7 +353,7 @@ def read_jsonl_object(bucket: str, key: str):
     except Exception as e:
         logger.error(f"Failed reading {key}: {e}")
 
-# ---- Bedrock Prompt ----
+# ---- Bedrock prompts ----
 JSON_INSTRUCTION = (
     "You are an SRE assistant summarizing alerts into structured JSON for a markdown digest.\n"
     "Rules:\n"
@@ -351,11 +376,27 @@ JSON_INSTRUCTION = (
     "}\n"
 )
 
+EXEC_SUMMARY_INSTRUCTION = (
+    "You are an expert SRE comms writer. Write an ultra-brief executive summary of the alert digest for senior leaders.\n"
+    "Constraints:\n"
+    "- 3 to 6 bullets or 2 short sentences.\n"
+    "- Prioritize Critical issues, major customer impact, and any cross-product patterns.\n"
+    "- Avoid jargon and metrics overload; keep it skimmable.\n"
+    "- Max ~90 words. No markdown except bullets ('- ').\n"
+    "Only output the summary text."
+)
+
+COMPONENT_ENRICH_INSTRUCTION = (
+    "You are a production SRE. For each item, infer a short 'component' label from title/summary/context.\n"
+    "Keep labels terse and technical, e.g., 'API Gateway', 'Auth', 'K8s/Node', 'Transcoder', 'DB', 'Cache', 'Queues', 'Ingress', 'Storage'.\n"
+    "If unsure, use 'General'. Respond ONLY with JSON array of objects: [{idx:number, component:string}]."
+)
+
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-def _build_bedrock_body(system: str, user_message: str, model_id: Optional[str]=None) -> bytes:
+def _build_bedrock_body(system: str, user_message: str) -> bytes:
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4096,
@@ -367,7 +408,7 @@ def _build_bedrock_body(system: str, user_message: str, model_id: Optional[str]=
     })
     return body.encode('utf-8')
 
-def _bedrock_invoke_with_retry(body_bytes: bytes, model_id: Optional[str]=None) -> Dict[str, Any]:
+def _bedrock_invoke_with_retry(body_bytes: bytes, model_id: Optional[str] = None) -> Dict[str, Any]:
     last_err = None
     mid = model_id or MODEL_ID
     for attempt in range(1, BEDROCK_MAX_RETRIES + 1):
@@ -401,7 +442,7 @@ def invoke_bedrock_json(session_id: str,
         "messageId": a["messageId"],
         "from": a.get("fromDisplay", ""),
         "channel": a.get("channel", ""),
-        "body": a["body"],
+        "body": a["body"],  # may be HTML
         "event_ts_utc": a.get("event_ts_utc"),
         "resolved_severity": a.get("norm_severity"),
         "product": a.get("product", "Unknown"),
@@ -421,13 +462,10 @@ def invoke_bedrock_json(session_id: str,
 
     body_bytes = _build_bedrock_body(system, user_message)
 
-    req_url = None
-    resp_url = None
     if DEBUG_MODE and log_s3:
         try:
             req_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/request-chunk-{chunk_index:03d}.json"
-            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=body_bytes, ContentType='application/json')  # type: ignore
-            req_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': req_key}, ExpiresIn=86400)
+            log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=req_key, Body=body_bytes, ContentType='application/json')
         except Exception as e:
             logger.error(f"Failed saving bedrock request: {e}")
 
@@ -438,7 +476,6 @@ def invoke_bedrock_json(session_id: str,
             try:
                 resp_key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/response-chunk-{chunk_index:03d}.json"
                 log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=resp_key, Body=raw.encode('utf-8'), ContentType='application/json')
-                resp_url = log_s3.generate_presigned_url('get_object', Params={'Bucket': BEDROCK_LOGS_S3_BUCKET, 'Key': resp_key}, ExpiresIn=86400)
             except Exception as e:
                 logger.error(f"Failed saving bedrock response: {e}")
 
@@ -447,35 +484,13 @@ def invoke_bedrock_json(session_id: str,
         except Exception as e:
             logger.error(f"JSON parse error in chunk {chunk_index}: {e}; raw preview={preview(raw, 240)}")
             parsed = {"kpis": {}, "groups": []}
-
-        if DEBUG_MODE:
-            stat = {"chunk_index": chunk_index, "chars": len(raw), "hash": body_hash(raw), "groups": len(parsed.get('groups', []))}
-            invoke_bedrock_json._last_response_stats = getattr(invoke_bedrock_json, "_last_response_stats", [])
-            invoke_bedrock_json._last_response_stats.append(stat)
-            invoke_bedrock_json._last_req_urls = getattr(invoke_bedrock_json, "_last_req_urls", {})
-            invoke_bedrock_json._last_resp_urls = getattr(invoke_bedrock_json, "_last_resp_urls", {})
-            invoke_bedrock_json._last_req_urls[chunk_index] = req_url
-            invoke_bedrock_json._last_resp_urls[chunk_index] = resp_url
-
         return parsed
     except Exception as e:
         logger.error(f"Bedrock invoke error: {e}")
         return {"kpis": {}, "groups": []}
 
-# ---- Executive Summary Bedrock ----
-EXEC_SUMMARY_INSTRUCTION = (
-    "You are an expert SRE comms writer. Write an ultra-brief executive summary of the alert digest for senior leaders.\n"
-    "Constraints:\n"
-    "- 3 to 6 bullets or 2 short sentences.\n"
-    "- Prioritize Critical issues, major customer impact, and any pattern across products.\n"
-    "- Avoid jargon and metrics overload; keep it skimmable.\n"
-    "- Max ~90 words. No markdown except bullets ('- ').\n"
-    "Only output the summary text."
-)
-
 def invoke_bedrock_exec_summary(session_id: str, window_label: str, agg: Dict) -> str:
     try:
-        # Flatten groups for summary
         groups_list = []
         for (_, _, _), g in agg.get("groups", {}).items():
             groups_list.append({
@@ -490,19 +505,39 @@ def invoke_bedrock_exec_summary(session_id: str, window_label: str, agg: Dict) -
             "groups": sorted(groups_list, key=lambda x: (0 if (x.get("severity","").lower()=="critical") else 1, -x.get("occurrences", 1)))
         }
         user_message = json.dumps(payload, indent=2, cls=DateTimeEncoder)
-        body_bytes = _build_bedrock_body(EXEC_SUMMARY_INSTRUCTION, user_message, model_id=EXEC_SUMMARY_MODEL_ID)
+        body_bytes = _build_bedrock_body(EXEC_SUMMARY_INSTRUCTION, user_message)
         response_body = _bedrock_invoke_with_retry(body_bytes, model_id=EXEC_SUMMARY_MODEL_ID)
-        text = response_body.get('content', [{}])[0].get('text', "").strip()
-        if DEBUG_MODE and log_s3:
-            try:
-                key = f"{BEDROCK_LOGS_S3_PREFIX.rstrip('/')}/{session_id}/exec-summary.txt"
-                log_s3.put_object(Bucket=BEDROCK_LOGS_S3_BUCKET, Key=key, Body=text.encode('utf-8'), ContentType='text/plain')
-            except Exception as e:
-                logger.error(f"Failed saving exec summary: {e}")
-        return text or ""
+        return response_body.get('content', [{}])[0].get('text', "").strip()
     except Exception as e:
         logger.error(f"Exec summary generation failed: {e}")
         return ""
+
+def invoke_bedrock_component_enrich(groups_missing: List[Dict]) -> Dict[int, str]:
+    """
+    groups_missing: list of dicts each with {idx:int, title:str, summary:str, product:str}
+    returns: {idx: component}
+    """
+    if not groups_missing:
+        return {}
+    try:
+        payload = [{"idx": g["idx"], "title": g.get("title",""), "summary": g.get("summary",""), "product": g.get("product","")} for g in groups_missing]
+        user_message = json.dumps(payload, indent=2, cls=DateTimeEncoder)
+        body_bytes = _build_bedrock_body(COMPONENT_ENRICH_INSTRUCTION, user_message)
+        response_body = _bedrock_invoke_with_retry(body_bytes, model_id=COMPONENT_MODEL_ID)
+        txt = response_body.get('content', [{}])[0].get('text', "").strip()
+        mapping = {}
+        try:
+            arr = json.loads(txt)
+            for obj in (arr or []):
+                idx = int(obj.get("idx"))
+                comp = (obj.get("component") or "").strip() or "General"
+                mapping[idx] = comp
+        except Exception as e:
+            logger.error(f"Component enrich parse error: {e}; raw={preview(txt,200)}")
+        return mapping
+    except Exception as e:
+        logger.error(f"Component enrich failed: {e}")
+        return {}
 
 # ---- Merge, filter & KPI recompute ----
 SEV_RANK = {"critical": 0, "warning": 1, "unknown": 2}
@@ -547,7 +582,6 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
                 }
             else:
                 item["occurrences"] += int(g.get("occurrences", 1) or 1)
-
                 def _p(s):
                     if not s: return None
                     try:
@@ -578,7 +612,6 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
     return agg
 
 def filter_groups_excluding_unknown_products(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dict[Tuple[str, str, str], Dict]:
-    """Return a new dict with groups whose product != 'Unknown' (case-insensitive)."""
     out = {}
     for k, v in groups_map.items():
         if _norm_product_name(v.get("product")).lower() != "unknown":
@@ -586,7 +619,6 @@ def filter_groups_excluding_unknown_products(groups_map: Dict[Tuple[str, str, st
     return out
 
 def recompute_group_kpis(groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, int]:
-    # Sum occurrences by severity; buckets are Critical, Warning, Unknown (Info removed)
     out = {"critical": 0, "warning": 0, "unknown": 0, "noise": 0}
     for (_, _, _), g in groups.items():
         sev = (g.get("severity") or "Unknown").lower()
@@ -595,7 +627,7 @@ def recompute_group_kpis(groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, 
             out[sev] += occ
         else:
             out["unknown"] += occ
-    out["total_alerts"] = out["critical"] + out["warning"] + out["unknown"]  # exact sum of displayed buckets
+    out["total_alerts"] = out["critical"] + out["warning"] + out["unknown"]
     return out
 
 def _rank_for_product(groups: List[Dict]) -> int:
@@ -635,14 +667,12 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
             _add(lines, line)
         _add(lines, "")
 
-    # Group by product, excluding 'Unknown'
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
         if _norm_product_name(g["product"]).lower() == "unknown":
             continue
         by_product.setdefault(g["product"], []).append(g)
 
-    # List detected products
     gm_set = set()
     other_set = set()
     for prod in by_product.keys():
@@ -658,7 +688,6 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
     _add(lines, "- " + (", ".join(sorted(other_set)) if other_set else "_None_"))
     _add(lines, "")
 
-    # Sort products: GovMeetings first, then by worst severity then name
     products_sorted = sorted(by_product.items(), key=_govmeetings_first_key)
 
     for product, items in products_sorted:
@@ -678,7 +707,6 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
             mags = ent.get("swagit_mag_ids") or []
             src_channels = g.get("source_channels") or []
 
-            # Prefix GovMeetings family/subproduct into title line
             is_gm, _canon = is_govmeetings_product(product)
             display_title = f"GovMeetings - {product}: {title}" if is_gm else title
 
@@ -693,7 +721,7 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
             _add(lines, f"- **First Seen (UTC):** {fs}")
             _add(lines, f"- **Last Seen (UTC):** {ls}")
             _add(lines, f"- **Summary:** {summ}")
-            _add(lines)  # blank line to separate actions
+            _add(lines)
             actions = g.get("suggested_actions") or []
             if actions:
                 _add(lines, "**Suggested Action Items**")
@@ -702,7 +730,6 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
             _add(lines, "")
         _add(lines, "")
 
-    # Appendix (optional previews)
     all_previews = []
     for (_, _, _), g in agg.get("groups", {}).items():
         for p in (g.get("appendix_previews") or [])[:3]:
@@ -842,7 +869,6 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
         "lines_parse_errors": 0,
         "cap_hit": False,
     }
-    skipped_time_samples = []
     day = start_utc.date()
     while day <= end_utc.date():
         for key, size in iter_day_objects(ALERTS_BUCKET, day):
@@ -853,10 +879,8 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
             if DEBUG_MODE:
                 logger.info(f"Reading {key} ({size} bytes)")
             for rec in read_jsonl_object(ALERTS_BUCKET, key):
-                stats["lines_scanned"] += 1
                 body = rec.get("body", "") or (rec.get("raw_event") or {}).get("text", "") or ""
                 if not body or not body.strip():
-                    stats["lines_skipped_blank"] += 1
                     continue
 
                 ts_raw = rec.get("event_ts_utc") or rec.get("ingestion_ts_utc")
@@ -868,42 +892,40 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                         ts = ts.astimezone(UTC)
                 except Exception:
                     ts = None
-                    stats["lines_parse_errors"] += 1
                 if ts is None or ts < start_utc or ts > end_utc:
-                    stats["lines_skipped_time"] += 1
                     continue
+
+                # ---- per-record filters and enrich ----
+                ch = (extract_channel(rec) or "").strip().lower()
+
+                # STRICT GovM-only for alerts_prod
+                if STRICT_GOVM_ONLY_IN_ALERTS_PROD and ch == "alerts_prod":
+                    if not is_relevant_to_govm(rec):
+                        # drop non-GovMeetings alerts from this mixed channel
+                        continue
 
                 norm_sev = derive_severity(rec)
                 if should_skip_unknown(rec, body, norm_sev):
                     continue
 
+                product_val = infer_product(rec)
+
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
-                    "body": body,  # may contain HTML; keep as-is for model consumption
+                    "body": body,  # keep HTML if present
                     "fromDisplay": rec.get("fromDisplay")
                                    or (rec.get("raw_event") or {}).get("fromDisplay")
                                    or rec.get("source") or rec.get("source_system") or "",
                     "channel": extract_channel(rec),
                     "event_ts_utc": ts_raw,
                     "norm_severity": norm_sev,
-                    "product": infer_product(rec)
+                    "product": product_val
                 })
-                stats["lines_valid"] += 1
+
                 if len(alerts) >= cap:
-                    stats["cap_hit"] = True
-                    if DEBUG_MODE:
-                        logger.info(f"Hit cap {cap}, stopping collection")
-                    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
                     return alerts
         day += dt.timedelta(days=1)
-    _log_collection_stats(stats, start_utc, end_utc, skipped_time_samples)
     return alerts
-
-def _log_collection_stats(stats: Dict, start_utc: dt.datetime, end_utc: dt.datetime, skipped_time_samples=None):
-    doc = {"tag": "DIGEST_COLLECTION_STATS", "window_start_utc": iso_z(start_utc), "window_end_utc": iso_z(end_utc), **stats}
-    if skipped_time_samples:
-        doc["skipped_time_samples"] = skipped_time_samples
-    logger.info(json.dumps(doc, cls=DateTimeEncoder))
 
 # ---- Lambda Handler ----
 def lambda_handler(event, context):
@@ -925,7 +947,7 @@ def lambda_handler(event, context):
         except Exception as e:
             logger.warning(f"Invalid state.last_end_utc: {state.get('last_end_utc')} ({e})")
 
-    # Compute window (allow override via event.window.start_utc/end_utc ISO8601)
+    # Compute window
     win_override = event.get("window") or {}
     if win_override.get("start_utc") and win_override.get("end_utc"):
         try:
@@ -934,7 +956,7 @@ def lambda_handler(event, context):
             tz_obj = get_output_tz()
             window_label = f"{fmt_in_tz_compact(start_utc, tz_obj)} - {fmt_in_tz_compact(end_utc, tz_obj)} {OUTPUT_TIMEZONE}"
         except Exception as e:
-            logger.warning(f"Invalid window override: {e}; falling back to computed window")
+            logger.warning(f"Invalid window override: {e}; falling back")
             start_utc, end_utc, window_label = get_window_bounds(prev_end_utc, interval_minutes)
     else:
         start_utc, end_utc, window_label = get_window_bounds(prev_end_utc, interval_minutes)
@@ -945,7 +967,9 @@ def lambda_handler(event, context):
     # Collect alerts
     alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
     logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
-    log_alert_details(alerts)
+    if DEBUG_MODE and LOG_ALERT_DETAIL:
+        for i, a in enumerate(alerts[:min(ALERT_LOG_LIMIT, len(alerts))]):
+            logger.info(json.dumps({"dbg":"alert", "i":i, "mid":a.get("messageId"), "channel":a.get("channel"), "product":a.get("product"), "sev":a.get("norm_severity")}, cls=DateTimeEncoder))
 
     if not alerts:
         md = "## 🛡️ SRE Digest\n\n_No alerts/messages found in this window._\n\n" + \
@@ -996,20 +1020,35 @@ def lambda_handler(event, context):
     filtered_groups = filter_groups_excluding_unknown_products(agg.get("groups", {}))
     agg["groups"] = filtered_groups
 
-    # KPIs computed from filtered groups; total is sum of buckets (no mismatch)
-    kpis_display = recompute_group_kpis(filtered_groups)
+    # Optional: Component enrichment pass for groups missing component
+    if GENERATE_COMPONENTS:
+        groups_list = list(agg["groups"].items())  # [((prod,title,sev), dict), ...]
+        missing_payload = []
+        idx_map = {}
+        for i, (k, g) in enumerate(groups_list):
+            comp = (g.get("component") or "").strip()
+            if not comp or comp == "—":
+                idx = len(missing_payload)
+                missing_payload.append({"idx": idx, "title": g.get("title",""), "summary": g.get("summary",""), "product": g.get("product","")})
+                idx_map[idx] = k
+        mapping = invoke_bedrock_component_enrich(missing_payload)
+        for idx, comp in mapping.items():
+            k = idx_map.get(idx)
+            if k and k in agg["groups"]:
+                agg["groups"][k]["component"] = comp
+
+    # KPIs recompute from filtered groups
+    kpis_display = recompute_group_kpis(agg.get("groups", {}))
     agg["kpis"] = kpis_display
 
-    # Executive summary (short, separate Bedrock call)
-    exec_summary = ""
-    if GENERATE_EXEC_SUMMARY:
-        exec_summary = invoke_bedrock_exec_summary(session_id, window_label, agg)
+    # Executive summary
+    exec_summary = invoke_bedrock_exec_summary(session_id, window_label, agg) if GENERATE_EXEC_SUMMARY else ""
 
     # Render & post
     final_md = render_markdown_lite(agg, window_label, interval_minutes, exec_summary) if LITE_DIGEST else render_markdown_full(agg, window_label, interval_minutes, exec_summary)
     posted = post_markdown_to_teams(final_md)
 
-    # Persist new state
+    # Persist state
     save_digest_state({
         "last_start_utc": iso_z(start_utc),
         "last_end_utc": iso_z(end_utc),
@@ -1019,7 +1058,7 @@ def lambda_handler(event, context):
         "saved_at_utc": iso_z(now_utc())
     })
 
-    out = {
+    return {
         "ok": True,
         "posted": posted,
         "window": window_label,
@@ -1030,8 +1069,6 @@ def lambda_handler(event, context):
         "mode": "lite" if LITE_DIGEST else "full",
         "kpis": agg["kpis"]
     }
-    return out
-
 
 if __name__ == "__main__":
     print(json.dumps({"note": "module compiles"}, indent=2))
