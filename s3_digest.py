@@ -42,8 +42,6 @@ LOG_ALERT_DETAIL = os.environ.get("LOG_ALERT_DETAIL", "true").lower() == "true"
 ALERT_LOG_LIMIT = int(os.environ.get("ALERT_LOG_LIMIT", "100"))
 LOG_BEDROCK_FULL = os.environ.get("LOG_BEDROCK_FULL", "false").lower() == "true"
 BEDROCK_FULL_MAX_CHARS = int(os.environ.get("BEDROCK_FULL_MAX_CHARS", "4000"))
-LOG_SKIPPED_TIME = os.environ.get("LOG_SKIPPED_TIME", "false").lower() == "true"
-SKIPPED_TIME_LIMIT = int(os.environ.get("SKIPPED_TIME_LIMIT", "20"))
 
 # Exec summary
 GENERATE_EXEC_SUMMARY = os.environ.get("GENERATE_EXEC_SUMMARY", "true").lower() == "true"
@@ -53,9 +51,12 @@ EXEC_SUMMARY_MODEL_ID = os.environ.get("EXEC_SUMMARY_MODEL_ID", MODEL_ID)
 GENERATE_COMPONENTS = os.environ.get("GENERATE_COMPONENTS", "true").lower() == "true"
 COMPONENT_MODEL_ID = os.environ.get("COMPONENT_MODEL_ID", MODEL_ID)
 
-# Strict GovMeetings filter for alerts_prod channel
+# Strict GovMeetings filter for alerts_prod channel (kept)
 STRICT_GOVM_ONLY_IN_ALERTS_PROD = os.environ.get("STRICT_GOVM_ONLY_IN_ALERTS_PROD", "true").lower() == "true"
 GOVM_EXTRA_KEYWORDS = [t.strip().lower() for t in os.environ.get("GOVM_EXTRA_KEYWORDS", "").split(",") if t.strip()]
+
+# Global rule: Only GovMeetings subproducts appear in digest
+ONLY_GOVM_SUBPRODUCTS = True  # hard requirement per spec
 
 # State persistence
 DIGEST_STATE_BUCKET = os.environ.get("DIGEST_STATE_BUCKET") or ALERTS_BUCKET
@@ -72,15 +73,41 @@ WARNING_CHANNELS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNELS
 CRITICAL_CHANNEL_HINTS = [t.strip().lower() for t in os.environ.get("CRITICAL_CHANNEL_HINTS", "critical,crit,sev1,p1,urgent").split(",") if t.strip()]
 WARNING_CHANNEL_HINTS  = [t.strip().lower() for t in os.environ.get("WARNING_CHANNEL_HINTS", "warning,warn,sev2,p2,alert").split(",") if t.strip()]
 
-# Product aliases (robust, token-based)
-PRODUCT_ALIAS_JSON = os.environ.get("PRODUCT_ALIAS_JSON", "{}")
+# ---------- GovMeetings subproduct aliases ----------
+# You can extend/override with GOVM_SUBPRODUCT_ALIASES env var (JSON)
+# Keys are alias tokens (case/format-insensitive), values are canonical subproduct names
+DEFAULT_GOVM_SUBPRODUCT_ALIASES = {
+    # Core family
+    "govmeetings": "GovMeetings",
+    "govmeeting": "GovMeetings",
+    "onemeeting": "OneMeeting",
+    "legistar": "Legistar",
+    "ilegislate": "iLegislate",
+    "mediamanager": "MediaManager",
+    "peak": "Peak",
+    "ufc": "UFC",
+    "swagit": "Swagit",
+
+    # Additional subproducts requested/observed
+    "iqm": "IQM",
+    "esignnotify": "IQM",     # often appears with IQM flows
+    "hypitia": "Hypitia",
+    "hytia": "Hypitia",       # common misspelling
+    "hypatia": "Hypitia",     # safeguard
+}
+GOVM_SUBPRODUCT_ALIASES_JSON = os.environ.get("GOVM_SUBPRODUCT_ALIASES", "{}")
 try:
-    PRODUCT_ALIASES: Dict[str, str] = json.loads(PRODUCT_ALIAS_JSON)  # e.g. {"hypitia": "Hypitia", "gm:legistar": "Legistar"}
+    _extra = json.loads(GOVM_SUBPRODUCT_ALIASES_JSON)
+    if isinstance(_extra, dict):
+        DEFAULT_GOVM_SUBPRODUCT_ALIASES.update({str(k): str(v) for k, v in _extra.items()})
 except Exception:
-    PRODUCT_ALIASES = {}
+    pass
+
 def _norm_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-ALIAS_MAP_NORM = {_norm_key(k): v for k, v in PRODUCT_ALIASES.items()}
+
+# Build a normalized alias map for token-level lookups
+GOVM_ALIAS_MAP_NORM: Dict[str, str] = {_norm_key(k): v for k, v in DEFAULT_GOVM_SUBPRODUCT_ALIASES.items()}
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -173,66 +200,88 @@ def _sev_emoji(sev: str) -> str:
         return "🟠"
     return "⚪"
 
-# ---- GovMeetings product detection ----
-GOVM_KEYWORDS = {"govmeeting", "govmeetings", "onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit"}
-GOVM_KEYWORDS |= set(GOVM_EXTRA_KEYWORDS)
+# ---- GovMeetings relevance & subproduct detection ----
+BASE_GOVM_KEYWORDS = {"govmeeting", "govmeetings", "onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit", "iqm", "hypitia"}
+BASE_GOVM_KEYWORDS |= set(GOVM_EXTRA_KEYWORDS)
 
 def is_govmeetings_product(product_or_text: str) -> Tuple[bool, str]:
+    """Detect GovMeetings family; return (is_govm, canonical_subproduct_or_text_or_Unknown)."""
     s = (product_or_text or "").strip()
     sl = s.lower()
-    submap = {
-        "onemeeting": "OneMeeting",
-        "legistar": "Legistar",
-        "ilegislate": "iLegislate",
-        "mediamanager": "MediaManager",
-        "peak": "Peak",
-        "ufc": "UFC",
-        "swagit": "Swagit",
-    }
-    for k, v in submap.items():
-        if k in sl:
-            return True, v
-    if "govmeeting" in sl or "govmeetings" in sl:
+    # Canonical subproduct mapping
+    for alias_norm, canon in GOVM_ALIAS_MAP_NORM.items():
+        if alias_norm and alias_norm in _norm_key(sl):
+            # If alias is govmeetings/govmeeting, still return GovMeetings (family)
+            return True, canon
+    # Fallback quick heuristic
+    if any(k in sl for k in BASE_GOVM_KEYWORDS):
         return True, "GovMeetings"
     return False, s or "Unknown"
 
 def _alias_lookup_tokenized(fields: List[str]) -> Optional[str]:
-    # token-level match against ALIAS_MAP_NORM
+    """Token-level alias resolution against GOVM subproducts, robust to separators and case."""
     for f in fields:
-        for tok in re.split(r"[^A-Za-z0-9]+", f or ""):
+        # Try token splits AND normalized contiguous scan
+        tokens = re.split(r"[^A-Za-z0-9]+", f or "")
+        for tok in tokens:
             if not tok:
                 continue
             nk = _norm_key(tok)
-            if nk in ALIAS_MAP_NORM:
-                return ALIAS_MAP_NORM[nk]
+            if nk in GOVM_ALIAS_MAP_NORM:
+                return GOVM_ALIAS_MAP_NORM[nk]
+        # Embedded patterns like 'govmeetings-iqm-esignnotify' -> find any alias inside normalized string
+        nf = _norm_key(f or "")
+        for alias_norm, canon in GOVM_ALIAS_MAP_NORM.items():
+            if alias_norm and alias_norm in nf:
+                return canon
     return None
 
-def infer_product(rec: Dict) -> str:
-    # Explicit fields first
-    p = (rec.get("product") or rec.get("service") or "").strip()
+def infer_govm_subproduct(rec: Dict) -> Tuple[bool, str]:
+    """
+    Return (is_govm_subproduct, canonical_subproduct_name).
+    Only canonical subproduct names are returned when True.
+    """
+    p = (rec.get("product") or rec.get("service") or "") or ""
     ch = extract_channel(rec)
     fr = rec.get("fromDisplay") or (rec.get("raw_event") or {}).get("fromDisplay") \
          or rec.get("source") or rec.get("source_system") or ""
     tags = rec.get("tags") or (rec.get("raw_event") or {}).get("tags") or []
     body = (rec.get("body") or (rec.get("raw_event") or {}).get("text") or "")
-    explicit_fields = [p, fr] + ([ch] if ch else [])
-    # 1) Exact/alias mapping on explicit fields first (no override by GM)
-    alias = _alias_lookup_tokenized(explicit_fields + list(tags))
+
+    # 1) Alias on explicit fields (highest priority)
+    alias = _alias_lookup_tokenized([p, fr, ch] + list(tags))
     if alias:
-        return alias
-    # 2) If explicit 'product' is set and not empty, return it as-is (canonize if alias value exists for same key)
+        if alias == "GovMeetings":
+            # Family tag alone isn't a subproduct; keep looking for a subproduct, else return family
+            alias_body = _alias_lookup_tokenized([body])
+            if alias_body and alias_body != "GovMeetings":
+                return True, alias_body
+            return True, "GovMeetings"
+        return True, alias
+
+    # 2) If explicit product string itself looks like a GM subproduct by embedded pattern
     if p:
-        return p
-    # 3) Try alias in body (HTML allowed) as a fallback
+        alias_p = _alias_lookup_tokenized([p])
+        if alias_p:
+            return True, alias_p
+
+    # 3) Body scan (supports embedded names like govmeetings-iqm-*)
     alias_body = _alias_lookup_tokenized([body])
     if alias_body:
-        return alias_body
-    # 4) GovMeetings family/subproduct detection LAST
+        return True, alias_body
+
+    # 4) Generic GovM family detection
     is_gm, canon = is_govmeetings_product(" | ".join([p, ch, fr, body]))
     if is_gm:
-        return canon
-    # 5) Last fallback
-    return fr or "Unknown"
+        # If only family-level identified, surface GovMeetings (still acceptable if ONLY_GOVM_SUBPRODUCTS is True? -> keep but may be filtered later)
+        return True, canon
+
+    return False, "Unknown"
+
+def is_relevant_to_govm(rec: Dict) -> bool:
+    """Used for alerts_prod strict filter and the global GovM-only rule."""
+    ok, _ = infer_govm_subproduct(rec)
+    return ok
 
 # ---- Attachment/skip helpers ----
 def is_trivial_text(txt: str) -> bool:
@@ -260,22 +309,6 @@ def should_skip_unknown(rec: Dict, body: str, sev: str) -> bool:
     text = (rec.get("raw_event") or {}).get("text") or body
     atts = attachments_list(rec)
     return (sev == "Unknown") and is_trivial_text(text) and attachments_all_unknown(atts)
-
-# ---- GovM relevance for alerts_prod ----
-def _is_relevant_to_govm_text(s: str) -> bool:
-    sl = (s or "").lower()
-    return any(k in sl for k in GOVM_KEYWORDS)
-
-def is_relevant_to_govm(rec: Dict) -> bool:
-    ch = extract_channel(rec) or ""
-    body = (rec.get("body") or (rec.get("raw_event") or {}).get("text") or "")
-    p = (rec.get("product") or rec.get("service") or "")
-    fr = rec.get("fromDisplay") or (rec.get("raw_event") or {}).get("fromDisplay") or ""
-    combo = " | ".join([ch, p, fr, body])
-    if _is_relevant_to_govm_text(combo):
-        return True
-    # Fallback to detector
-    return is_govmeetings_product(combo)[0]
 
 # ---- State (S3) ----
 def load_digest_state() -> Optional[Dict]:
@@ -611,22 +644,38 @@ def merge_chunk_results(chunks: List[Dict]) -> Dict:
                     ent[k_merge] = _merge_lists(ent.get(k_merge), g_ent.get(k_merge), capn)
     return agg
 
-def filter_groups_excluding_unknown_products(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dict[Tuple[str, str, str], Dict]:
+def filter_groups_to_govm_subproducts(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dict[Tuple[str, str, str], Dict]:
+    """Keep only groups where product is a known GovM subproduct (or GovMeetings family if nothing better)."""
     out = {}
     for k, v in groups_map.items():
-        if _norm_product_name(v.get("product")).lower() != "unknown":
+        prod = (v.get("product") or "").strip()
+        nk = _norm_key(prod)
+        # Accept if canonical value found in alias values
+        if prod in set(GOVM_ALIAS_MAP_NORM.values()):
             out[k] = v
+            continue
+        # Accept if normalized key itself maps to a canonical GovM subproduct
+        if nk in GOVM_ALIAS_MAP_NORM and GOVM_ALIAS_MAP_NORM[nk] in set(GOVM_ALIAS_MAP_NORM.values()):
+            out[k] = v
+            continue
+        # Accept if product equals 'GovMeetings' (family) — optional; keep for visibility
+        if prod.lower() == "govmeetings":
+            out[k] = v
+            continue
+        # else drop
     return out
 
 def recompute_group_kpis(groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, int]:
+    """
+    KPIs should count distinct listed alerts (groups), NOT sum of occurrences.
+    """
     out = {"critical": 0, "warning": 0, "unknown": 0, "noise": 0}
     for (_, _, _), g in groups.items():
         sev = (g.get("severity") or "Unknown").lower()
-        occ = int(g.get("occurrences", 1) or 1)
         if sev in out:
-            out[sev] += occ
+            out[sev] += 1
         else:
-            out["unknown"] += occ
+            out["unknown"] += 1
     out["total_alerts"] = out["critical"] + out["warning"] + out["unknown"]
     return out
 
@@ -667,10 +716,9 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
             _add(lines, line)
         _add(lines, "")
 
+    # Group by product (GovM subproducts only have been filtered)
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
-        if _norm_product_name(g["product"]).lower() == "unknown":
-            continue
         by_product.setdefault(g["product"], []).append(g)
 
     gm_set = set()
@@ -692,12 +740,11 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
 
     for product, items in products_sorted:
         _add(lines, f"### 📦 Product — {product}")
-        items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), -int(x.get('occurrences', 1)), x.get('title','')))
+        items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), x.get('title','')))
         for g in items:
             emoji = _sev_emoji(g.get("severity"))
             title = g.get("title")
             summ = g.get("summary")
-            occ = g.get("occurrences", 1)
             fs = g.get("first_seen_utc") or ""
             ls = g.get("last_seen_utc") or ""
             component = g.get("component") or "—"
@@ -717,19 +764,19 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
             if hosts: _add(lines, f"- **Affected Hosts:** {', '.join(hosts[:10])}")
             if nodes: _add(lines, f"- **Rebooted Nodes:** {', '.join(nodes)}")
             if mags:  _add(lines, f"- **Swagit MAG:** {', '.join(mags)}")
-            _add(lines, f"- **Occurrences:** {occ}")
             _add(lines, f"- **First Seen (UTC):** {fs}")
             _add(lines, f"- **Last Seen (UTC):** {ls}")
             _add(lines, f"- **Summary:** {summ}")
-            _add(lines)
             actions = g.get("suggested_actions") or []
             if actions:
+                _add(lines, "")
                 _add(lines, "**Suggested Action Items**")
                 for a in actions:
                     _add(lines, f"- [ ] {a}")
             _add(lines, "")
         _add(lines, "")
 
+    # Appendix
     all_previews = []
     for (_, _, _), g in agg.get("groups", {}).items():
         for p in (g.get("appendix_previews") or [])[:3]:
@@ -759,7 +806,7 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int, ex
     _add(lines, "")
 
     k = agg.get("kpis", {})
-    _add(lines, "**Summary (grouped, by occurrences)**")
+    _add(lines, "**Summary (grouped, unique alerts)**")
     _add(lines, f"- 🔴 Critical: {k.get('critical', 0)}")
     _add(lines, f"- 🟠 Warning: {k.get('warning', 0)}")
     _add(lines, f"- ⚪ Other: {k.get('unknown', 0)}")
@@ -773,8 +820,6 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int, ex
 
     by_product: Dict[str, List[Dict]] = {}
     for (_, _, _), g in agg.get("groups", {}).items():
-        if _norm_product_name(g["product"]).lower() == "unknown":
-            continue
         by_product.setdefault(g["product"], []).append(g)
 
     gm_set = set()
@@ -795,12 +840,11 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int, ex
     products_sorted = sorted(by_product.items(), key=_govmeetings_first_key)
     for product, items in products_sorted:
         _add(lines, f"### 📦 {product}")
-        items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), -int(x.get('occurrences', 1))))
+        items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), x.get('title','')))
         for g in items:
             emoji = _sev_emoji(g.get("severity"))
             title = g.get("title")
             summ = g.get("summary")
-            occ = g.get("occurrences", 1)
             fs = g.get("first_seen_utc") or ""
             ls = g.get("last_seen_utc") or ""
             ent = g.get("entities") or {}
@@ -812,7 +856,7 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int, ex
             is_gm, _canon = is_govmeetings_product(product)
             display_title = f"GovMeetings - {product}: {title}" if is_gm else title
 
-            _add(lines, f"- {emoji} **{display_title}** — {summ}{host_txt}{ch_txt}  _(x{occ}; {fs} → {ls})_")
+            _add(lines, f"- {emoji} **{display_title}** — {summ}{host_txt}{ch_txt}  _({fs} → {ls})_")
         _add(lines, "")
 
     md = "\n".join(lines).strip()
@@ -895,20 +939,24 @@ def collect_alerts_s3(start_utc: dt.datetime, end_utc: dt.datetime, cap: int) ->
                 if ts is None or ts < start_utc or ts > end_utc:
                     continue
 
-                # ---- per-record filters and enrich ----
+                # ---- per-record filters & enrich ----
                 ch = (extract_channel(rec) or "").strip().lower()
 
-                # STRICT GovM-only for alerts_prod
+                # STRICT GovM-only for alerts_prod (kept)
                 if STRICT_GOVM_ONLY_IN_ALERTS_PROD and ch == "alerts_prod":
                     if not is_relevant_to_govm(rec):
-                        # drop non-GovMeetings alerts from this mixed channel
                         continue
+
+                # Global rule: only GovM subproducts make it into digest
+                is_gm, canon_sub = infer_govm_subproduct(rec)
+                if not is_gm:
+                    continue  # drop non-GovM entirely
+                # Use canonical subproduct if available; else family
+                product_val = canon_sub
 
                 norm_sev = derive_severity(rec)
                 if should_skip_unknown(rec, body, norm_sev):
                     continue
-
-                product_val = infer_product(rec)
 
                 alerts.append({
                     "messageId": rec.get("messageId", "unknown"),
@@ -966,13 +1014,11 @@ def lambda_handler(event, context):
 
     # Collect alerts
     alerts = collect_alerts_s3(start_utc, end_utc, MAX_ALERTS)
-    logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
-    if DEBUG_MODE and LOG_ALERT_DETAIL:
-        for i, a in enumerate(alerts[:min(ALERT_LOG_LIMIT, len(alerts))]):
-            logger.info(json.dumps({"dbg":"alert", "i":i, "mid":a.get("messageId"), "channel":a.get("channel"), "product":a.get("product"), "sev":a.get("norm_severity")}, cls=DateTimeEncoder))
+    if DEBUG_MODE:
+        logger.info(f"Collected {len(alerts)} candidate alerts for window {window_label}")
 
     if not alerts:
-        md = "## 🛡️ SRE Digest\n\n_No alerts/messages found in this window._\n\n" + \
+        md = "## 🛡️ SRE Digest\n\n_No GovMeetings alerts in this window._\n\n" + \
              f"🕒 Last update: {fmt_in_tz_compact(now_utc(), tz_obj)} • Next: {next_local_time}"
         posted = post_markdown_to_teams(md)
         save_digest_state({
@@ -1016,13 +1062,15 @@ def lambda_handler(event, context):
     # Merge results
     agg = merge_chunk_results([r or {"kpis": {}, "groups": []} for r in results])
 
-    # Filter out groups with product == Unknown to match display requirements
-    filtered_groups = filter_groups_excluding_unknown_products(agg.get("groups", {}))
-    agg["groups"] = filtered_groups
+    # Keep only GovM subproducts/groups
+    agg["groups"] = filter_groups_to_govm_subproducts(agg.get("groups", {}))
 
-    # Optional: Component enrichment pass for groups missing component
+    # KPI recompute: counts unique groups per severity (no occurrence inflation)
+    agg["kpis"] = recompute_group_kpis(agg.get("groups", {}))
+
+    # Optional: Component enrichment
     if GENERATE_COMPONENTS:
-        groups_list = list(agg["groups"].items())  # [((prod,title,sev), dict), ...]
+        groups_list = list(agg["groups"].items())
         missing_payload = []
         idx_map = {}
         for i, (k, g) in enumerate(groups_list):
@@ -1037,11 +1085,7 @@ def lambda_handler(event, context):
             if k and k in agg["groups"]:
                 agg["groups"][k]["component"] = comp
 
-    # KPIs recompute from filtered groups
-    kpis_display = recompute_group_kpis(agg.get("groups", {}))
-    agg["kpis"] = kpis_display
-
-    # Executive summary
+    # Exec summary
     exec_summary = invoke_bedrock_exec_summary(session_id, window_label, agg) if GENERATE_EXEC_SUMMARY else ""
 
     # Render & post
