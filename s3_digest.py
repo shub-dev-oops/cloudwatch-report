@@ -724,10 +724,10 @@ def filter_groups_govm_only(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dic
                 out[new_key] = v
     return out
 
+# ---- replace the whole function ----
 def recompute_group_kpis(groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, int]:
     """
-    Severity buckets count groups.
-    Total alerts counts sum of occurrences across all groups.
+    Severity buckets and Total alerts all count occurrences (not groups).
     """
     out = {"critical": 0, "warning": 0, "unknown": 0, "noise": 0}
     total_occ = 0
@@ -736,9 +736,9 @@ def recompute_group_kpis(groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, 
         occ = int(g.get("occurrences", 1) or 1)
         total_occ += occ
         if sev in out:
-            out[sev] += 1
+            out[sev] += occ
         else:
-            out["unknown"] += 1
+            out["unknown"] += occ
     out["total_alerts"] = total_occ
     return out
 
@@ -768,9 +768,9 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
 
     k = agg.get("kpis", {})
     _add(lines, "### Summary KPIs")
-    _add(lines, f"- 🔴 Critical (groups): {k.get('critical', 0)}")
-    _add(lines, f"- 🟠 Warning (groups): {k.get('warning', 0)}")
-    _add(lines, f"- ⚪ Other (groups): {k.get('unknown', 0)}")
+    _add(lines, f"- 🔴 Critical : {k.get('critical', 0)}")
+    _add(lines, f"- 🟠 Warning : {k.get('warning', 0)}")
+    _add(lines, f"- ⚪ Other : {k.get('unknown', 0)}")
     _add(lines, f"- **Total alerts (occurrences): {k.get('total_alerts', 0)}**")
     _add(lines, "")
     if exec_summary:
