@@ -56,6 +56,8 @@ PRODUCT_COMPONENT_MODEL_ID = os.environ.get("PRODUCT_COMPONENT_MODEL_ID", MODEL_
 # Strict GovMeetings filter for alerts_prod channel
 STRICT_GOVM_ONLY_IN_ALERTS_PROD = os.environ.get("STRICT_GOVM_ONLY_IN_ALERTS_PROD", "true").lower() == "true"
 GOVM_EXTRA_KEYWORDS = [t.strip().lower() for t in os.environ.get("GOVM_EXTRA_KEYWORDS", "").split(",") if t.strip()]
+# Optional denylist backstop for stray non-GovMeetings product tokens (normalized)
+DISALLOWED_PRODUCT_TOKENS_RAW = [t.strip().lower() for t in os.environ.get("DISALLOWED_PRODUCT_TOKENS", "").split(",") if t.strip()]
 
 # State persistence
 DIGEST_STATE_BUCKET = os.environ.get("DIGEST_STATE_BUCKET") or ALERTS_BUCKET
@@ -81,6 +83,8 @@ except Exception:
     GOVM_CANON = {}
 DEFAULT_GOVM = {
     "govmeetings": "GovMeetings",
+    "govm": "GovMeetings",
+    "gm": "GovMeetings",
     "onemeeting": "OneMeeting",
     "legistar": "Legistar",
     "ilegislate": "iLegislate",
@@ -112,6 +116,8 @@ def _norm_key(s: str) -> str:
 ALIAS_MAP_NORM = {_norm_key(k): v for k, v in PRODUCT_ALIASES.items()}
 CANON_KEYS_NORM = {_norm_key(k): v for k, v in GOVM_CANON.items()}
 ALL_GOVM_TOKENS = set(CANON_KEYS_NORM.keys())
+# Normalize denylist tokens once
+DISALLOWED_TOKENS_NORM = {_norm_key(t) for t in DISALLOWED_PRODUCT_TOKENS_RAW}
 
 # ---- AWS Clients ----
 s3 = boto3.client("s3")
@@ -205,7 +211,7 @@ def _sev_emoji(sev: str) -> str:
     return "⚪"
 
 # ---- GovMeetings relevance & product parsing ----
-GOVM_KEYWORDS = {"govmeeting", "govmeetings", "onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit"} | set(GOVM_EXTRA_KEYWORDS)
+GOVM_KEYWORDS = {"govmeeting", "govmeetings", "govm", "gm", "onemeeting", "legistar", "ilegislate", "mediamanager", "peak", "ufc", "swagit"} | set(GOVM_EXTRA_KEYWORDS)
 
 def _is_relevant_to_govm_text(s: str) -> bool:
     sl = (s or "").lower()
@@ -227,7 +233,7 @@ def is_relevant_to_govm(rec: Dict) -> bool:
 def _alias_lookup_tokenized(fields: List[str]) -> Optional[str]:
     # Try canonical GovM subproduct first (embedded or token)
     for f in fields:
-        m = re.search(r"(?:govmeetings?|gm)[:-_ ]+([a-z0-9]+)", (f or "").lower())
+        m = re.search(r"(?:govmeetings?|gm|govm)[:-_ ]+([a-z0-9]+)", (f or "").lower())
         if m:
             key = _norm_key(m.group(1))
             if key in CANON_KEYS_NORM:
@@ -345,6 +351,9 @@ def read_jsonl_object(bucket: str, key: str):
         logger.error(f"Failed reading {key}: {e}")
 
 # ---- Bedrock prompts ----
+# Allowed GovMeetings product set for LLM guidance
+ALLOWED_PRODUCTS_LIST = sorted(set(GOVM_CANON.values()))
+ALLOWED_PRODUCTS_TXT = ", ".join(ALLOWED_PRODUCTS_LIST)
 JSON_INSTRUCTION = (
     "You are an SRE assistant summarizing alerts into structured JSON for a markdown digest.\n"
     "Rules:\n"
@@ -355,6 +364,7 @@ JSON_INSTRUCTION = (
     "- Group very similar items (same problem) into a single group.\n"
     "- For each group, produce a concise title, a single-sentence summary, and up to 5 suggested_actions.\n"
     "- If product is blank or 'Unknown', infer from text if obvious, else leave as 'Unknown'.\n"
+    f"- For 'product', choose only from: {ALLOWED_PRODUCTS_TXT}. If unclear, use 'GovMeetings' or 'Unknown'.\n"
     "- IMPORTANT: Always include 'source_channels' for each group; derive by collecting distinct 'channel' values from items in that group. Never omit this field.\n"
     "- If an item's body contains HTML (rich-text), treat it as content (strip tags if needed for previews) but do not discard the information.\n"
     "Respond ONLY with JSON matching this schema: {\n"
@@ -700,6 +710,10 @@ def filter_groups_govm_only(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dic
         prod = (v.get("product") or "").strip()
         title = v.get("title","")
         sev = v.get("severity","Unknown").capitalize()
+        # Drop groups containing any explicitly disallowed product tokens
+        blob_norm = _norm_key(" ".join([prod, title, v.get("summary", "")]))
+        if any(tok and tok in blob_norm for tok in DISALLOWED_TOKENS_NORM):
+            continue
         # Try to promote embedded subproduct from product/title/summary
         alias = _alias_lookup_tokenized([prod, title, v.get("summary","")]) or prod
         new_prod = alias
