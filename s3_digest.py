@@ -365,6 +365,8 @@ JSON_INSTRUCTION = (
     "- For each group, produce a concise title, a single-sentence summary, and up to 5 suggested_actions.\n"
     "- If product is blank or 'Unknown', infer from text if obvious, else leave as 'Unknown'.\n"
     f"- For 'product', choose only from: {ALLOWED_PRODUCTS_TXT}. If unclear, use 'GovMeetings' or 'Unknown'.\n"
+    "- Determine each group's product from the provided per-item 'product' values: use the most specific canonical subproduct present across the items in that group (majority if mixed). Use 'GovMeetings' only when no subproduct appears.\n"
+    "- Prefix each group's title with the chosen product (e.g., 'Legistar - <rest>').\n"
     "- IMPORTANT: Always include 'source_channels' for each group; derive by collecting distinct 'channel' values from items in that group. Never omit this field.\n"
     "- If an item's body contains HTML (rich-text), treat it as content (strip tags if needed for previews) but do not discard the information.\n"
     "Respond ONLY with JSON matching this schema: {\n"
@@ -715,7 +717,11 @@ def filter_groups_govm_only(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dic
         if any(tok and tok in blob_norm for tok in DISALLOWED_TOKENS_NORM):
             continue
         # Try to promote embedded subproduct from product/title/summary
-        alias = _alias_lookup_tokenized([prod, title, v.get("summary","")]) or prod
+        scan_fields = [prod, title, v.get("summary", "")]
+        # also scan appendix previews if present (helps recover subproduct from example text)
+        for pv in (v.get("appendix_previews") or [])[:5]:
+            scan_fields.append(str(pv))
+        alias = _alias_lookup_tokenized(scan_fields) or prod
         new_prod = alias
         # Keep only GovM family
         if is_govm_subproduct(new_prod) or _norm_key(new_prod) == _norm_key(GOVM_CANON.get("govmeetings","GovMeetings")):
@@ -737,6 +743,19 @@ def filter_groups_govm_only(groups_map: Dict[Tuple[str, str, str], Dict]) -> Dic
             else:
                 out[new_key] = v
     return out
+
+# ---- Title normalization to include canonical product ----
+def _ensure_title_with_product(prod: str, title: str) -> str:
+    pt = (prod or "").strip()
+    t = (title or "").strip()
+    if not pt:
+        return t
+    # If already prefixed with the same product, keep
+    if re.match(rf"^{re.escape(pt)}\s*[-–—:]+\s*", t, flags=re.IGNORECASE):
+        return t
+    # If title starts with a generic GovMeetings token, strip it before applying product
+    t2 = re.sub(r"^(?:gov\s*meetings?|gm|govm)\s*[-–—:]+\s*", "", t, flags=re.IGNORECASE)
+    return f"{pt} - {t2 or t}"
 
 # ---- replace the whole function ----
 def recompute_group_kpis(groups: Dict[Tuple[str, str, str], Dict]) -> Dict[str, int]:
@@ -815,6 +834,8 @@ def render_markdown_full(agg: Dict, window_label: str, interval_minutes: int, ex
             mags = ent.get("swagit_mag_ids") or []
             src_channels = g.get("source_channels") or []
 
+            # Ensure title carries the canonical product
+            title = _ensure_title_with_product(g.get("product",""), title)
             _add(lines, f"**{emoji} {title}**")
             _add(lines, f"- **Severity:** {emoji} {g.get('severity')}")
             _add(lines, f"- **Component:** _{component}_")
@@ -887,7 +908,7 @@ def render_markdown_lite(agg: Dict, window_label: str, interval_minutes: int, ex
         items.sort(key=lambda x: (SEV_RANK.get((x.get('severity') or '').lower(), 9), x.get('title','')))
         for g in items:
             emoji = _sev_emoji(g.get("severity"))
-            title = g.get("title")
+            title = _ensure_title_with_product(g.get("product",""), g.get("title"))
             summ = g.get("summary")
             fs = g.get("first_seen_utc") or ""
             ls = g.get("last_seen_utc") or ""
