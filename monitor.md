@@ -33,6 +33,37 @@ helm upgrade --install aws-for-fluent-bit eks/aws-for-fluent-bit \
 
 
 ```
+# Backup and edit CoreDNS config
+### 
+```
+# Backup and edit CoreDNS config
+kubectl -n kube-system get cm coredns -o yaml > /tmp/coredns.yaml
+
+# In the Corefile 'block', ensure you have (order matters is ok here):
+#   errors
+#   log
+# Example fragment:
+# .:53 {
+#     errors
+#     log
+#     health
+#     ready
+#     kubernetes cluster.local in-addr.arpa ip6.arpa {
+#       pods insecure
+#       fallthrough in-addr.arpa ip6.arpa
+#     }
+#     prometheus :9153
+#     forward . /etc/resolv.conf
+#     cache 30
+# }
+# Then apply:
+kubectl -n kube-system apply -f /tmp/coredns.yaml
+kubectl -n kube-system rollout restart deploy/coredns
+kubectl -n kube-system rollout status deploy/coredns
+```
+
+
+
 
 # 1) One-paste CloudShell script — collect CoreDNS health + logs (current & crashed) and save to a file
 
