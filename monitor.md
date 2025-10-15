@@ -1,3 +1,114 @@
+You're hitting a classic **resourceVersion conflict** + a couple typos. Let’s fix it cleanly and safely.
+
+## What went wrong
+
+* Namespace typo: `kube-systen` → should be `kube-system`.
+* You edited an *old* copy of the ConfigMap; the live object changed → `the object has been modified; please apply your changes to the latest version`.
+
+## Safe, repeatable way to enable CoreDNS query logging (temporary)
+
+### 1) Export the **latest** CoreDNS Corefile to a local file
+
+```bash
+kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' > Corefile
+```
+
+### 2) Edit the `Corefile` locally
+
+Add `errors` and `log` inside the main server block (`.:53 { ... }`), keeping the rest as-is. A typical good block looks like this (don’t copy blindly; merge into yours):
+
+```
+.:53 {
+    errors
+    log
+    health
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf
+    cache 30
+    reload
+    loadbalance
+}
+```
+
+> Keep the order roughly like above; whitespace is fine. Do **not** remove other lines/plugins you already have.
+
+### 3) Recreate the ConfigMap from your edited Corefile (avoids resourceVersion issues)
+
+```bash
+kubectl -n kube-system create configmap coredns \
+  --from-file=Corefile=./Corefile \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+### 4) Restart CoreDNS to pick changes
+
+```bash
+kubectl -n kube-system rollout restart deploy/coredns
+kubectl -n kube-system rollout status deploy/coredns
+```
+
+### 5) Confirm logs (and that Fluent Bit picks them up)
+
+```bash
+kubectl -n kube-system logs -l k8s-app=kube-dns --tail=100
+```
+
+---
+
+## Alternatives if you prefer “edit in place”
+
+* **Server-side apply** (lets the apiserver merge and resolve fields):
+
+```bash
+kubectl -n kube-system apply --server-side --force-conflicts -f /tmp/coredns.yaml
+```
+
+* **Direct inline edit** (no tmp files):
+
+```bash
+kubectl -n kube-system edit configmap coredns
+```
+
+> Paste `errors` and `log` into the `data.Corefile` block, save & exit. If you still hit a conflict, re-run the command—it loads the latest version.
+
+---
+
+## Quick rollback (remove verbose logging)
+
+1. Open editor:
+
+```bash
+kubectl -n kube-system edit configmap coredns
+```
+
+2. Remove the `log` line (keep `errors`), save.
+3. Restart:
+
+```bash
+kubectl -n kube-system rollout restart deploy/coredns
+```
+
+---
+
+## Pro tips
+
+* Your previous command had typos:
+
+  * `opply` → `apply`
+  * `kube-systen` → `kube-system`
+  * `/tmp/coredns.yanl` → `/tmp/coredns.yaml`
+* If you see `kubectl.kubernetes.io/last-applied-configuration` noise, you can ignore it; or remove that annotation once using:
+
+```bash
+kubectl -n kube-system annotate configmap coredns kubectl.kubernetes.io/last-applied-configuration-
+```
+
+If you paste your current **exact** Corefile (sanitized), I’ll return the corrected version with `log` added in the right place and minimal diff.
 
 # 0) Log
 Got it — this is a common gotcha. Seeing logs under /aws/eks/fluentbit doesn’t mean your setting was ignored; that log group is typically the Fluent Bit pod’s own stdout/stderr (its container logs). Your workload logs are controlled by the aws-for-fluent-bit output.conf generated from the Helm values. Let’s (1) verify current config, (2) confirm where workload logs are landing, and (3) force the desired log group.
