@@ -1,3 +1,130 @@
+#
+
+
+## A) Metrics-based alarms (early symptoms of the same failure)
+
+```bash
+# Vars
+REGION=$(aws configure get region)
+CLUSTER="aasmp-eks1"
+TOPIC_ARN=<>
+
+# CoreDNS CPU > 80% (cache/loop pressure)
+aws cloudwatch put-metric-alarm --region "$REGION" \
+  --alarm-name "CoreDNS-HighCPU" \
+  --alarm-description "CoreDNS CPU > 80% may precede DNS lag like RUN-107111" \
+  --namespace ContainerInsights --metric-name pod_cpu_utilization \
+  --dimensions Name=ClusterName,Value=${CLUSTER} Name=Namespace,Value=kube-system Name=PodName,Value=coredns \
+  --statistic Average --period 300 --evaluation-periods 2 \
+  --threshold 80 --comparison-operator GreaterThanThreshold \
+  --treat-missing-data missing --alarm-actions "$TOPIC_ARN"
+
+# CoreDNS restarts > 0 in 5m (crash/loop)
+aws cloudwatch put-metric-alarm --region "$REGION" \
+  --alarm-name "CoreDNS-Restarts" \
+  --alarm-description "Any CoreDNS restart (post-upgrade regression signal)" \
+  --namespace ContainerInsights --metric-name pod_number_of_restarts \
+  --dimensions Name=ClusterName,Value=${CLUSTER} Name=Namespace,Value=kube-system Name=PodName,Value=coredns \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 0 --comparison-operator GreaterThanThreshold \
+  --alarm-actions "$TOPIC_ARN"
+
+# Packet drops (CNI/socket stress)
+aws cloudwatch put-metric-alarm --region "$REGION" \
+  --alarm-name "CoreDNS-PacketDrops" \
+  --alarm-description "CoreDNS RX packet drops > 0 (CNI/socket symptom)" \
+  --namespace ContainerInsights --metric-name pod_network_rx_packets_dropped \
+  --dimensions Name=ClusterName,Value=${CLUSTER} Name=Namespace,Value=kube-system Name=PodName,Value=coredns \
+  --statistic Sum --period 300 --evaluation-periods 2 \
+  --threshold 1 --comparison-operator GreaterThanThreshold \
+  --treat-missing-data missing --alarm-actions "$TOPIC_ARN"
+```
+
+## B) Log-based alarm (the exact signatures from the past incidents)
+
+Make sure Fluent Bit ships to `/aws/containerinsights/${CLUSTER}/application`. Then:
+
+```bash
+APP_LOG_GROUP="/aws/containerinsights/${CLUSTER}/application"
+
+# Turn error lines into a metric
+aws logs put-metric-filter \
+  --log-group-name "$APP_LOG_GROUP" \
+  --filter-name "CoreDNSErrorsFilter" \
+  --filter-pattern '"kube-system" "coredns" ("SERVFAIL" "timeout" "read udp" "plugin/cache" "connection refused")' \
+  --metric-transformations metricName=CoreDNSErrorCount,metricNamespace=EKS/CoreDNS,metricValue=1
+
+# Alert when errors spike (>= 5 in 5m)
+aws cloudwatch put-metric-alarm --region "$REGION" \
+  --alarm-name "CoreDNS-ErrorLines" \
+  --alarm-description "CoreDNS SERVFAIL/timeout/cache errors like RUN-107111" \
+  --namespace "EKS/CoreDNS" --metric-name "CoreDNSErrorCount" \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 5 --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching --alarm-actions "$TOPIC_ARN"
+```
+
+## C) Change-window guardrails (during add-on upgrade)
+
+* **Scale** CoreDNS to ≥2 and set `maxUnavailable=0`:
+
+  ```bash
+  kubectl -n kube-system scale deploy coredns --replicas=2
+  kubectl -n kube-system patch deploy coredns -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}'
+  ```
+* **Live probe** while upgrading (proves no DNS regression):
+
+  ```bash
+  kubectl delete pod dns-probe --ignore-not-found
+  kubectl run dns-probe --image=busybox:1.28 --restart=Never -- sleep 3600
+  ( while true; do
+      kubectl exec dns-probe -- nslookup kubernetes.default >/dev/null \
+        && echo "$(date) DNS OK" || echo "$(date) DNS FAIL";
+      sleep 5;
+    done )
+  ```
+* **Strict sequencing**: CoreDNS → vpc-cni → kube-proxy → ebs-csi → efs-csi.
+* **Immediate rollback** for any breach:
+
+  ```bash
+  # find current/prev versions first
+  aws eks describe-addon --cluster-name ${CLUSTER} --addon-name coredns --query addon.addonVersion
+
+  # rollback example
+  aws eks update-addon --cluster-name ${CLUSTER} --addon-name coredns \
+    --resolve-conflicts OVERWRITE --addon-version <previousVersion>
+  ```
+
+## D) Kube-system “tripwires” (catch the same cascade early)
+
+```bash
+# aws-node (CNI) restarts → DNS issues often follow
+aws cloudwatch put-metric-alarm --region "$REGION" \
+  --alarm-name "CNI-Restarts" \
+  --alarm-description "aws-node restarted (network churn can precede DNS issues)" \
+  --namespace ContainerInsights --metric-name pod_number_of_restarts \
+  --dimensions Name=ClusterName,Value=${CLUSTER} Name=Namespace,Value=kube-system Name=PodName,Value=aws-node \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 0 --comparison-operator GreaterThanThreshold \
+  --alarm-actions "$TOPIC_ARN"
+
+# kube-proxy restarts
+aws cloudwatch put-metric-alarm --region "$REGION" \
+  --alarm-name "KubeProxy-Restarts" \
+  --alarm-description "kube-proxy restarted (service routing churn)" \
+  --namespace ContainerInsights --metric-name pod_number_of_restarts \
+  --dimensions Name=ClusterName,Value=${CLUSTER} Name=Namespace,Value=kube-system Name=PodName,Value=kube-proxy \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 0 --comparison-operator GreaterThanThreshold \
+  --alarm-actions "$TOPIC_ARN"
+```
+
+
+
+
+
+
+# ---
 ```
 # 0) Namespace var
 NS=kube-system
