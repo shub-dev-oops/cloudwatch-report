@@ -1,4 +1,29 @@
-Awesome. Here’s exactly what you asked for:
+
+# 0) Log
+Got it — this is a common gotcha. Seeing logs under /aws/eks/fluentbit doesn’t mean your setting was ignored; that log group is typically the Fluent Bit pod’s own stdout/stderr (its container logs). Your workload logs are controlled by the aws-for-fluent-bit output.conf generated from the Helm values. Let’s (1) verify current config, (2) confirm where workload logs are landing, and (3) force the desired log group.
+
+1) Verify what the chart actually rendered
+```
+# What values are in use?
+helm get values -n amazon-cloudwatch aws-for-fluent-bit
+
+# Inspect the rendered Fluent Bit output to CloudWatch
+kubectl -n amazon-cloudwatch get cm aws-for-fluent-bit -o jsonpath='{.data.output\.conf}{"\n"}'
+```
+
+```
+helm upgrade --install aws-for-fluent-bit eks/aws-for-fluent-bit \
+  -n amazon-cloudwatch \
+  --set cloudWatch.enabled=true \
+  --set cloudWatch.region=$(aws configure get region) \
+  --set cloudWatch.autoCreateGroup=true \
+  --set cloudWatch.logGroupTemplate="/aws/containerinsights/{{.ClusterName}}/application" \
+  --set cloudWatch.logStreamTemplate="{{.Namespace}}/{{.PodName}}/{{.ContainerName}}" \
+  --set cloudWatch.logRetentionDays=30 \
+  --set kinesis.enabled=false \
+  --set firehose.enabled=false
+
+```
 
 # 1) One-paste CloudShell script — collect CoreDNS health + logs (current & crashed) and save to a file
 
