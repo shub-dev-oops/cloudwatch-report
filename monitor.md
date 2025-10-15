@@ -1,7 +1,8 @@
 Awesome. Here’s exactly what you asked for:
 
-1) One-paste CloudShell script — collect CoreDNS health + logs (current & crashed) and save to a file
+# 1) One-paste CloudShell script — collect CoreDNS health + logs (current & crashed) and save to a file
 
+```bash
 # ===== CoreDNS evidence collector (run in CloudShell with kubectl + aws CLI configured) =====
 set -euo pipefail
 
@@ -41,13 +42,15 @@ OUT="coredns_diagnostics_${CLUSTER}_${TS}.log"
 } | tee "${OUT}"
 
 echo "✅ Saved CoreDNS diagnostics to: ${OUT}"
+```
 
-You can attach that single file (coredns_diagnostics_<cluster>_<timestamp>.log) to your CR/RCA.
+You can attach that single file (`coredns_diagnostics_<cluster>_<timestamp>.log`) to your CR/RCA.
 
-⸻
+---
 
-2) Check if CoreDNS (pod) logs are already flowing to CloudWatch
+# 2) Check if CoreDNS (pod) logs are already flowing to CloudWatch
 
+```bash
 # Replace with your cluster name
 CLUSTER="aasmp-eks1"
 
@@ -56,16 +59,18 @@ aws logs describe-log-groups --log-group-name-prefix "/aws/containerinsights/${C
 
 # Control plane logs (separate from pod logs):
 aws logs describe-log-groups --log-group-name-prefix "/aws/eks/${CLUSTER}/cluster" --query 'logGroups[].logGroupName' --output table
+```
 
-	•	If you see /aws/containerinsights/<cluster>/application, your pod stdout/stderr (including CoreDNS) can be shipped there (via Fluent Bit).
-	•	If you only see /aws/eks/<cluster>/cluster, that’s control plane logs (API/audit/etc.), not pod logs.
+* If you see `/aws/containerinsights/<cluster>/application`, your **pod stdout/stderr** (including CoreDNS) can be shipped there (via Fluent Bit).
+* If you only see `/aws/eks/<cluster>/cluster`, that’s **control plane logs** (API/audit/etc.), not pod logs.
 
-⸻
+---
 
-3) Enable shipping CoreDNS/pod logs to CloudWatch (no Grafana needed)
+# 3) Enable shipping CoreDNS/pod logs to CloudWatch (no Grafana needed)
 
-If pod logs aren’t in CloudWatch yet, deploy CloudWatch Agent + AWS for Fluent Bit via Helm (AWS-supported):
+If pod logs aren’t in CloudWatch yet, deploy **CloudWatch Agent + AWS for Fluent Bit** via Helm (AWS-supported):
 
+```bash
 # Add repos
 helm repo add aws-cloudwatch https://aws.github.io/amazon-cloudwatch-agent
 helm repo add eks https://aws.github.io/eks-charts
@@ -87,32 +92,37 @@ helm upgrade --install aws-for-fluent-bit eks/aws-for-fluent-bit \
   --set cloudWatch.logStreamPrefix=fluent-bit- \
   --set kinesis.enabled=false \
   --set firehose.enabled=false
+```
 
-That will start sending all pod logs (including CoreDNS in kube-system) to:
+That will start sending **all pod logs** (including CoreDNS in `kube-system`) to:
 
+```
 /aws/containerinsights/aasmp-eks1/application
+```
 
-(Optional) Enable control plane logging too (API, audit, etc.)
+### (Optional) Enable control plane logging too (API, audit, etc.)
 
+```bash
 aws eks update-cluster-config \
   --name aasmp-eks1 \
   --logging '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}'
+```
 
+---
 
-⸻
+# 4) Quick CloudWatch Logs Insights query for CoreDNS errors (once logs are flowing)
 
-4) Quick CloudWatch Logs Insights query for CoreDNS errors (once logs are flowing)
+In **CloudWatch Logs → Log groups →** `/aws/containerinsights/aasmp-eks1/application` → *Logs Insights*, run:
 
-In CloudWatch Logs → Log groups → /aws/containerinsights/aasmp-eks1/application → Logs Insights, run:
-
+```sql
 fields @timestamp, @message, kubernetes.pod_name
 | filter kubernetes.namespace_name = "kube-system"
 | filter kubernetes.pod_name like /coredns/
 | filter @message like /timeout|SERVFAIL|plugin\/cache|read udp|connection refused|dial tcp/
 | sort @timestamp desc
 | limit 100
+```
 
+---
 
-⸻
-
-If you want, I can also give you a tiny Terraform/CloudFormation snippet to deploy the Helm releases or a metric filter + alarm on those error patterns.
+If you want, I can also give you a tiny **Terraform/CloudFormation** snippet to deploy the Helm releases or a **metric filter + alarm** on those error patterns.
