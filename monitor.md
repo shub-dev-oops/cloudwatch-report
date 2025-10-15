@@ -63,6 +63,17 @@ kubectl -n kube-system rollout status deploy/coredns
 ```
 
 
+### Quick chec
+```
+# On the node via Fluent Bit pod:
+kubectl -n amazon-cloudwatch exec "$FB_POD" -- sh -lc 'grep coredns /var/log/containers/*.log | head -n 3 || true'
+
+# In CloudWatch:
+aws logs describe-log-groups --log-group-name-prefix "/aws/containerinsights/aasmp-eks1/application"
+# Then check recent streams for namespace 'kube-system' and pod name containing 'coredns'
+
+```
+
 
 
 # 1) One-paste CloudShell script — collect CoreDNS health + logs (current & crashed) and save to a file
