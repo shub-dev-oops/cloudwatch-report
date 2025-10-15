@@ -20,8 +20,17 @@ helm upgrade --install aws-for-fluent-bit eks/aws-for-fluent-bit \
   --set cloudWatch.logGroupTemplate="/aws/containerinsights/{{.ClusterName}}/application" \
   --set cloudWatch.logStreamTemplate="{{.Namespace}}/{{.PodName}}/{{.ContainerName}}" \
   --set cloudWatch.logRetentionDays=30 \
-  --set kinesis.enabled=false \
-  --set firehose.enabled=false
+  --set input.tail.path="/var/log/containers/*.log" \
+  --set input.tail.parser="docker" \
+  --set input.tail.memBufLimit="50MB" \
+  --set input.tail.skipLongLines=true \
+  --set input.tail.db="/var/fluent-bit/state/flb_kube.db" \
+  --set input.tail.readFromHead=true \
+  --set extraVolumeMounts[0].name=varlog \
+  --set extraVolumeMounts[0].mountPath=/var/log \
+  --set extraVolumes[0].name=varlog \
+  --set extraVolumes[0].hostPath.path=/var/log
+
 
 ```
 
