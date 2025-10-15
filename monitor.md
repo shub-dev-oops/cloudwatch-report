@@ -1,3 +1,41 @@
+```
+# 0) Namespace var
+NS=kube-system
+
+# 1) Save current (broken) Corefile just in case
+kubectl -n $NS get cm coredns -o jsonpath='{.data.Corefile}' > Corefile.broken.$(date +%s)
+
+# 2) Apply a known-good Corefile (minimal, stable)
+cat > /tmp/Corefile.good <<'EOF'
+.:53 {
+    errors
+    health
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf
+    cache 30
+    reload
+    loadbalance
+}
+EOF
+
+kubectl -n $NS create configmap coredns --from-file=Corefile=/tmp/Corefile.good --dry-run=client -o yaml | kubectl apply -f -
+
+# 3) Restart and watch
+kubectl -n $NS rollout restart deploy/coredns
+kubectl -n $NS rollout status deploy/coredns --timeout=5m
+
+# 4) Quick health check
+kubectl get pods -n $NS -l k8s-app=kube-dns -o wide
+kubectl run dns-test --image=busybox:1.28 -it --rm --restart=Never -- nslookup kubernetes.default
+
+```
+
+
 You're hitting a classic **resourceVersion conflict** + a couple typos. Let’s fix it cleanly and safely.
 
 ## What went wrong
