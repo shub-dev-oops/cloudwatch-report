@@ -38,7 +38,7 @@ aws logs put-metric-filter \
 aws logs put-metric-filter \
   --log-group-name "$LOG_GROUP" \
   --filter-name "ALBController-ReconcileErrors-Plain" \
-  --filter-pattern '"aws-load-balancer-controller" ("failed to reconcile" || timeout || "reconcile error")' \
+  --filter-pattern "\"aws-load-balancer-controller\" (\"failed to reconcile\" || timeout || \"reconcile error\")" \
   --metric-transformations metricName="ALBReconcileErrors",metricNamespace="EKS/Ingress",metricValue=1,defaultValue=0
 
 aws cloudwatch put-metric-alarm \
