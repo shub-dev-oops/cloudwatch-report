@@ -1,264 +1,236 @@
-Looking at this SOP and the recurring CoreDNS issues, let me think through a comprehensive analysis and action plan:
+You got it—here’s a clean, **CLI-only** setup for **Container Insights on EKS** (metrics + logs) using **IRSA** + **Helm**. Copy, paste, and run section-by-section.
 
-## Immediate Diagnostic Questions
+> Assumes: `aws`, `kubectl`, `helm`, and `jq` are installed and you have cluster admin. Replace variables as needed.
 
-**Critical gaps in the current SOP:**
-1. **What specific error logs are appearing in CoreDNS?** (DNS timeouts, memory issues, crashes?)
-2. **How frequently is this restart needed?** (Daily? Weekly? This indicates severity)
-3. **Are there any patterns?** (Time of day, traffic spikes, specific queries?)
-4. **What's the actual failure mode?** (Pods crashing, unresponsive, slow responses?)
+---
 
-## Checking CoreDNS Version
+# 0) Set variables
 
 ```bash
-# Method 1: Check the deployment image
-kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}'
+# >>> change these <<<
+export CLUSTER=aasmp-eks1
+export REGION=us-east-1
 
-# Method 2: Check running pods
-kubectl describe deployment coredns -n kube-system | grep Image
-
-# Method 3: CoreDNS version via logs
-kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50 | grep version
+# usually fine to keep
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export OIDC_URL=$(aws eks describe-cluster --region $REGION --name $CLUSTER --query "cluster.identity.oidc.issuer" --output text | sed 's#^https://##')
 ```
 
-```
-# Pod image tag (what’s actually running)
-kubectl -n kube-system get deploy coredns -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+---
 
-# EKS add-on version (source of truth if using managed add-on)
-aws eks describe-addon --cluster-name aasmp-eks1 --addon-name coredns \
-  --query 'addon.{AddonVersion:addonVersion,Status:status,Health:health.issues}' --output table
-
-# If using Helm instead of EKS add-on:
-helm -n kube-system list | grep -i coredns
-helm -n kube-system history coredns
-
-```
-
-
-
-## Root Cause Analysis - What Could Be Wrong?
-
-### 1. **Resource Exhaustion** (Most Likely)
-```bash
-# Check if CoreDNS is hitting memory/CPU limits
-kubectl describe deployment coredns -n kube-system | grep -A 5 "Limits\|Requests"
-
-# Check if pods are being OOMKilled
-kubectl get pods -n kube-system -l k8s-app=kube-dns -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].lastState.terminated.reason}{"\n"}{end}'
-```
-
-**Action:** Increase CoreDNS resource limits
-```bash
-kubectl set resources deployment coredns -n kube-system \
-  --limits=memory=512Mi,cpu=500m \
-  --requests=memory=256Mi,cpu=100m
-```
-
-### 2. **DNS Query Load**
-```bash
-# Enable CoreDNS metrics (if not already enabled)
-kubectl get configmap coredns -n kube-system -o yaml
-
-# Check if Prometheus metrics are enabled
-# Look for "prometheus :9153" in the Corefile
-```
-
-### 3. **Pod Anti-Affinity Issues**
-CoreDNS pods might be scheduling on the same nodes, creating single points of failure.
+# 1) Ensure OIDC provider exists for IRSA
 
 ```bash
-# Check current pod distribution
-kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide
-
-# Add pod anti-affinity to spread across nodes
-kubectl edit deployment coredns -n kube-system
+aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[].Arn" --output text | grep -q "$OIDC_URL" || \
+aws iam create-open-id-connect-provider \
+  --url "https://$OIDC_URL" \
+  --client-id-list "sts.amazonaws.com" \
+  --thumbprint-list "9e99a48a9960b14926bb7f3b02e22da0afd10df6"
 ```
 
-## What to Tell Naveen - Action Plan
+---
 
-### **Short-term (This Week)**
+# 2) Create IAM roles (IRSA) for:
 
-1. **Increase CoreDNS Replicas**
+* **CloudWatch Agent** (metrics → CloudWatch “ContainerInsights”)
+* **Fluent Bit** (logs → CloudWatch Logs)
+
+## 2a) Trust policies (bind SA → role)
+
 ```bash
-kubectl scale deployment coredns -n kube-system --replicas=3
-# Or even 4-5 for high-traffic prod
-```
-
-2. **Increase Resource Limits**
-```bash
-# Current limits might be too low
-kubectl set resources deployment coredns -n kube-system \
-  --limits=memory=512Mi,cpu=500m \
-  --requests=memory=256Mi,cpu=250m
-```
-
-3. **Enable NodeLocal DNSCache**
-This caches DNS queries on each node, dramatically reducing load on CoreDNS:
-```bash
-# Deploy NodeLocal DNSCache
-kubectl apply -f https://k8s.io/examples/admin/dns/nodelocaldns.yaml
-```
-
-4. **Update CoreDNS Version**
-```bash
-# Check EKS recommended version
-aws eks describe-addon-versions --addon-name coredns --kubernetes-version 1.XX
-
-# Update via EKS addon
-aws eks update-addon --cluster-name aasmp-eks1 \
-  --addon-name coredns \
-  --addon-version v1.XX.X-eksbuild.X
-```
-
-### **Mid-term (Next 2 Weeks)**
-
-5. **Implement Proper Monitoring & Alerting**
-
-```yaml
-# Add ServiceMonitor for Prometheus
-apiVersion: v1
-kind: Service
-metadata:
-  name: coredns-metrics
-  namespace: kube-system
-  labels:
-    k8s-app: kube-dns
-spec:
-  selector:
-    k8s-app: kube-dns
-  ports:
-  - name: metrics
-    port: 9153
-    protocol: TCP
-    targetPort: 9153
-```
-
-**Key Metrics to Monitor:**
-```bash
-# CoreDNS request rate
-rate(coredns_dns_requests_total[5m])
-
-# CoreDNS errors
-rate(coredns_dns_responses_total{rcode="SERVFAIL"}[5m])
-
-# CoreDNS latency
-histogram_quantile(0.99, rate(coredns_dns_request_duration_seconds_bucket[5m]))
-
-# Cache hit rate
-rate(coredns_cache_hits_total[5m]) / rate(coredns_dns_requests_total[5m])
-```
-
-6. **Configure PodDisruptionBudget**
-```yaml
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: coredns-pdb
-  namespace: kube-system
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      k8s-app: kube-dns
-```
-
-7. **Optimize CoreDNS Configuration**
-```bash
-kubectl edit configmap coredns -n kube-system
-```
-
-Add these optimizations to the Corefile:
-```
-.:53 {
-    errors
-    health {
-        lameduck 5s
-    }
-    ready
-    kubernetes cluster.local in-addr.arpa ip6.arpa {
-        pods insecure
-        fallthrough in-addr.arpa ip6.arpa
-        ttl 30
-    }
-    prometheus :9153
-    forward . /etc/resolv.conf {
-        max_concurrent 1000
-        policy random  # Better load distribution
-    }
-    cache 30 {  # Increase cache duration
-        success 9984 30
-        denial 9984 5
-    }
-    loop
-    reload
-    loadbalance round_robin  # Better distribution
+cat > /tmp/trust-cwagent.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::$ACCOUNT_ID:oidc-provider/$OIDC_URL" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": { "StringEquals": { "$OIDC_URL:sub": "system:serviceaccount:amazon-cloudwatch:cloudwatch-agent" } }
+  }]
 }
+EOF
+
+cat > /tmp/trust-fluentbit.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::$ACCOUNT_ID:oidc-provider/$OIDC_URL" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": { "StringEquals": { "$OIDC_URL:sub": "system:serviceaccount:kube-system:aws-for-fluent-bit" } }
+  }]
+}
+EOF
 ```
 
-### **Long-term (Next Month)**
+## 2b) Create roles
 
-8. **Investigate AWS Load Balancer Controller**
-The ingress reconciliation issue suggests the AWS LB Controller might be making excessive DNS queries:
 ```bash
-# Check AWS LB Controller logs
-kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --tail=100
-
-# Check its resource usage
-kubectl top pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+aws iam create-role --role-name EKS-CWAgent-$CLUSTER --assume-role-policy-document file:///tmp/trust-cwagent.json
+aws iam create-role --role-name EKS-FluentBit-$CLUSTER --assume-role-policy-document file:///tmp/trust-fluentbit.json
 ```
 
-9. **Consider External DNS Solution**
-For external domains, consider using Route53 directly or External-DNS operator.
+## 2c) Attach policies (use AWS managed for speed)
 
-10. **Implement Automated Remediation**
-Create a Kubernetes CronJob or use a tool like Kubernetes Reloader to automatically restart CoreDNS if it becomes unhealthy (though this is a band-aid, not a fix).
+```bash
+# Metrics & basic system discovery
+aws iam attach-role-policy --role-name EKS-CWAgent-$CLUSTER --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
 
-## Enhanced Observability Setup
-
-### **Grafana Dashboard Queries**
-```promql
-# DNS Request Rate
-sum(rate(coredns_dns_requests_total[5m])) by (type)
-
-# DNS Response Codes
-sum(rate(coredns_dns_responses_total[5m])) by (rcode)
-
-# Cache Efficiency
-sum(rate(coredns_cache_hits_total[5m])) / sum(rate(coredns_dns_requests_total[5m])) * 100
-
-# Pod Restarts
-kube_pod_container_status_restarts_total{namespace="kube-system",pod=~"coredns.*"}
+# Logs to CloudWatch Logs (use tighter custom policy later if you want)
+aws iam attach-role-policy --role-name EKS-FluentBit-$CLUSTER --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
 ```
 
-### **CloudWatch Logs Insights Queries**
-```sql
-# If using CloudWatch Container Insights
-fields @timestamp, @message
-| filter kubernetes.namespace_name = "kube-system"
-| filter kubernetes.pod_name like /coredns/
-| filter @message like /error|Error|ERROR|timeout|refused/
-| sort @timestamp desc
-| limit 100
+> (Optional hardening later: replace `CloudWatchLogsFullAccess` with a least-priv policy granting `logs:CreateLogGroup`, `CreateLogStream`, `PutLogEvents`, `DescribeLogStreams` on your log groups.)
+
+---
+
+# 3) Create namespaces & service accounts (with IRSA annotations)
+
+```bash
+kubectl create namespace amazon-cloudwatch --dry-run=client -o yaml | kubectl apply -f -
+kubectl create sa cloudwatch-agent -n amazon-cloudwatch --dry-run=client -o yaml | kubectl apply -f -
+kubectl create sa aws-for-fluent-bit -n kube-system --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl annotate sa cloudwatch-agent -n amazon-cloudwatch eks.amazonaws.com/role-arn=arn:aws:iam::$ACCOUNT_ID:role/EKS-CWAgent-$CLUSTER --overwrite
+kubectl annotate sa aws-for-fluent-bit -n kube-system eks.amazonaws.com/role-arn=arn:aws:iam::$ACCOUNT_ID:role/EKS-FluentBit-$CLUSTER --overwrite
 ```
 
-## Critical Questions for Naveen
+---
 
-1. **What's the actual error in iLegislate when it's down?** (DNS resolution failure, timeout, 502/503?)
-2. **How often does this happen?** (Multiple times daily = emergency)
-3. **What's the traffic pattern?** (Constant or spiky?)
-4. **When was CoreDNS last updated?** (Could be running ancient version)
-5. **Is there a WAF/CDN in front?** (CloudFlare, etc. could help)
-6. **What's the current replica count?** (Likely only 2, should be 3-5)
+# 4) Add EKS charts & install **CloudWatch Agent** (metrics)
 
-## Recommended Immediate Actions (Priority Order)
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update
 
-1. ✅ **Scale CoreDNS to 4-5 replicas** (5 minutes)
-2. ✅ **Increase memory limits to 512Mi** (5 minutes)
-3. ✅ **Check and update CoreDNS version** (30 minutes)
-4. ✅ **Enable comprehensive logging** (15 minutes)
-5. ✅ **Deploy NodeLocal DNSCache** (1 hour)
-6. ✅ **Set up monitoring dashboard** (2 hours)
-7. ✅ **Optimize Corefile configuration** (30 minutes)
+cat > cwagent-values.yaml <<'EOF'
+clusterName: aasmp-eks1
+region: us-east-1
+serviceAccount:
+  create: false
+  name: cloudwatch-agent
+  annotations: {}
+# Request/limit modest so it’s light
+agent:
+  resources:
+    requests: { cpu: "100m", memory: "200Mi" }
+    limits:   { cpu: "200m", memory: "400Mi" }
+# Enable Kubernetes metrics collection (Container Insights)
+logs:
+  metrics_collected:
+    kubernetes: {}
+# Emit Container Insights enhanced metrics
+# (The chart ships a default ConfigMap; leaving as default is fine for CI)
+EOF
 
-This is a **systemic issue**, not a "restart and pray" situation. The restarts are treating symptoms, not the disease.
+helm upgrade --install cloudwatch-agent eks/cloudwatch-agent \
+  -n amazon-cloudwatch -f cwagent-values.yaml
+```
+
+---
+
+# 5) Install **Fluent Bit** (logs → CloudWatch Logs)
+
+Pick a single cluster log group to keep things tidy.
+
+```bash
+export CW_LOG_GROUP=/aws/eks/$CLUSTER/cluster
+
+# Make sure the group exists (no-op if it does)
+aws logs create-log-group --log-group-name "$CW_LOG_GROUP" --region $REGION 2>/dev/null || true
+
+helm upgrade --install aws-for-fluent-bit eks/aws-for-fluent-bit -n kube-system \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-for-fluent-bit \
+  --set cloudWatch.region=$REGION \
+  --set cloudWatch.logGroupName="$CW_LOG_GROUP" \
+  --set cloudWatch.autoCreateGroup=true
+```
+
+> This ships kubelet/kube-apiserver/container stdout/stderr into the log group. You can later fine-tune parsers/filters to cut noise.
+
+---
+
+# 6) Validate
+
+```bash
+# Pods up and running?
+kubectl -n amazon-cloudwatch get pods
+kubectl -n kube-system get pods | grep fluent-bit
+
+# Metrics appearing? (give it 2–3 minutes)
+aws cloudwatch list-metrics --namespace "ContainerInsights" --region $REGION \
+  --query 'Metrics[?contains(Dimensions[?Name==`ClusterName`].Value, `'$CLUSTER'`)]' --output table
+
+# Logs flowing?
+aws logs describe-log-streams --log-group-name "$CW_LOG_GROUP" --region $REGION --max-items 5
+```
+
+Open **CloudWatch → Metrics → ContainerInsights** and you should see cluster, node, namespace, pod, and deployment level metrics.
+Open **CloudWatch → Logs → Log groups** and check `$CW_LOG_GROUP` for streams.
+
+---
+
+# 7) (Optional) CoreDNS-focused alarms (now that CI is on)
+
+**Pod restart spike (namespace-wide, no pod names needed)**
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name "CoreDNS-Restarts-Spike" \
+  --namespace "ContainerInsights" \
+  --metric-name "pod_number_of_container_restarts" \
+  --dimensions Name=ClusterName,Value=$CLUSTER Name=Namespace,Value=kube-system \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 3 --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching
+```
+
+**Deployment availability dip**
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name "CoreDNS-Availability-Dip" \
+  --metrics '[
+    {"Id":"desired","MetricStat":{"Metric":{"Namespace":"ContainerInsights","MetricName":"deployment_desired","Dimensions":[
+      {"Name":"ClusterName","Value":"'$CLUSTER'"} ,{"Name":"Namespace","Value":"kube-system"},{"Name":"Deployment","Value":"coredns"}]},"Period":60,"Stat":"Average"}},
+    {"Id":"available","MetricStat":{"Metric":{"Namespace":"ContainerInsights","MetricName":"deployment_available","Dimensions":[
+      {"Name":"ClusterName","Value":"'$CLUSTER'"} ,{"Name":"Namespace","Value":"kube-system"},{"Name":"Deployment","Value":"coredns"}]},"Period":60,"Stat":"Average"}},
+    {"Id":"breach","Expression":"available < desired","Label":"unavailable","ReturnData":true}
+  ]' \
+  --comparison-operator GreaterThanThreshold --threshold 0 \
+  --evaluation-periods 5 --treat-missing-data breaching
+```
+
+(Add `--alarm-actions arn:aws:sns:$REGION:$ACCOUNT_ID:your-topic` to wire paging.)
+
+---
+
+# 8) (Optional) ALB Controller “reconcile errors” alarm (cluster-wide)
+
+```bash
+# Create a metric from controller logs (already shipped by Fluent Bit)
+aws logs put-metric-filter \
+  --log-group-name "$CW_LOG_GROUP" \
+  --filter-name "ALBControllerReconcileErrors" \
+  --filter-pattern '"failed to reconcile" || timeout || "reconcile error"' \
+  --metric-transformations metricName="ALBReconcileErrors",metricNamespace="EKS/Ingress",metricValue=1,defaultValue=0
+
+aws cloudwatch put-metric-alarm \
+  --alarm-name "ALB-Controller-ReconcileErrors" \
+  --namespace "EKS/Ingress" \
+  --metric-name "ALBReconcileErrors" \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 3 --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching
+```
+
+---
+
+## Notes / gotchas
+
+* If you use **cluster-autoscaler** or many pods, keep Fluent Bit filters lean to control log costs.
+* Container Insights doesn’t scrape CoreDNS Prometheus metrics; it surfaces pod/deployment/node stats. For DNS latency/rcode panels, keep Prometheus scraping `:9153`.
+* You can scope logs initially to `kube-system` by altering the Fluent Bit chart filters (reduce cost/noise), then expand.
+
+If you want, I can also give you **least-priv IAM JSON** for Fluent Bit, and a **CloudWatch Dashboard** JSON (CoreDNS restarts/availability + node & pod CPU/Mem) that you can import in one click.
