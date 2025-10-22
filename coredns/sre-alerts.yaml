@@ -1,0 +1,44 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sre-jira-run-108628-rules
+  namespace: sre-monitoring
+  labels:
+    release: sre-stack # This label MUST match your Helm install
+spec:
+  groups:
+    - name: jira.run-108628.alerts
+      rules:
+        # Alert 1: The Root Cause (White-Box DNS)
+        - alert: CoreDNSForwardErrors
+          expr: rate(coredns_plugin_errors_total{plugin="forward"}[5m]) > 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "CoreDNS forward plugin is reporting errors"
+            description: "Root cause for RUN-108628. CoreDNS is failing to forward to its upstream resolver."
+
+        # Alert 2: The Symptom (White-Box Ingress)
+        - alert: IngressHigh5xxRate
+          expr: |
+            sum(rate(nginx_ingress_controller_requests_total{status=~"50."}[5m]))
+            /
+            sum(rate(nginx_ingress_controller_requests_total[5m]))
+            * 100 > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Ingress is serving a high rate of 5xx errors"
+            description: "Over 5% of requests to the NGINX ingress are 502s/504s. This is a direct customer impact. Check CoreDNS or app upstreams."
+
+        # Alert 3: The Impact (Black-Box DNS)
+        - alert: DnsProbeJobFailed
+          expr: kube_job_status_failed{job_name="dns-blackbox-probe"} > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Synthetic DNS probe CronJob is failing"
+            description: "The 'dns-blackbox-probe' CronJob failed, meaning its nslookup command failed. Active DNS outage is likely."

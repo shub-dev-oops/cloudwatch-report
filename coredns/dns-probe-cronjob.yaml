@@ -1,0 +1,21 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dns-blackbox-probe
+  namespace: sre-monitoring
+spec:
+  schedule: "*/1 * * * *" # Run every 1 minute
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: dns-probe
+              image: busybox:1.36
+              command: ["/bin/sh", "-c"]
+              args:
+                - "nslookup -timeout=5 kubernetes.default.svc.cluster.local"
+          restartPolicy: OnFailure
+      backoffLimit: 1
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
