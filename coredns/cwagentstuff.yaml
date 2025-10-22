@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cwagentconfig
+  namespace: amazon-cloudwatch
+data:
+  cwagentconfig.json: |
+    {
+      "agent": { "region": "us-east-1" },
+      "logs": { "metrics_collected": { "prometheus": {} } },
+      "metrics": {
+        "metrics_collected": {
+          "prometheus": {
+            "emf_processor": { "metric_declaration": [
+              {
+                "source_labels": ["job"],
+                "label_matcher": "coredns",
+                "dimensions": [["ClusterName","job"]],
+                "metric_selectors": [
+                  "^coredns_dns_request_count_total$",
+                  "^coredns_dns_request_duration_seconds_bucket$",
+                  "^coredns_cache_hits_total$",
+                  "^coredns_dns_response_rcode_count_total$"
+                ]
+              }
+            ]},
+            "ecs_service_discovery": false,
+            "resources": [
+              {
+                "endpoint": "http://coredns-metrics.kube-system.svc.cluster.local:9153/metrics",
+                "job_name": "coredns"
+              }
+            ]
+          }
+        },
+        "append_dimensions": {
+          "ClusterName": "aasmd-eks1"
+        },
+        "aggregation_dimensions": [["ClusterName","job"]]
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coredns-metrics
+  namespace: kube-system
+  labels: { k8s-app: kube-dns }
+spec:
+  selector: { k8s-app: kube-dns }
+  ports:
+  - name: metrics
+    port: 9153
+    targetPort: 9153
